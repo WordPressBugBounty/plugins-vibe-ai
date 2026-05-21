@@ -1,0 +1,1 @@
+# plugins-vibe-ai
