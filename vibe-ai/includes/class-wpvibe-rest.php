@@ -262,6 +262,51 @@ class WPVibe_REST {
 			),
 		) );
 
+		// --- Database content operations (surgical str_replace on posts/meta/options) ---
+
+		register_rest_route( $namespace, '/content/edit', array(
+			'methods'             => 'POST',
+			'callback'            => array( $this, 'edit_content' ),
+			'permission_callback' => array( $this, 'can_edit_content' ),
+			'args'                => array(
+				'target_type' => array(
+					'type'              => 'string',
+					'required'          => true,
+					'enum'              => array( 'post', 'meta', 'option' ),
+					'sanitize_callback' => 'sanitize_key',
+				),
+				'post_id'     => array( 'type' => 'integer', 'required' => false ),
+				'field'       => array( 'type' => 'string', 'required' => false, 'sanitize_callback' => 'sanitize_key' ),
+				'meta_key'    => array( 'type' => 'string', 'required' => false, 'sanitize_callback' => 'sanitize_text_field' ),
+				'option_name' => array( 'type' => 'string', 'required' => false, 'sanitize_callback' => 'sanitize_text_field' ),
+				'old_content' => array( 'type' => 'string', 'required' => true, 'sanitize_callback' => array( 'WPVibe_REST', 'sanitize_file_content' ) ),
+				'new_content' => array( 'type' => 'string', 'required' => true, 'sanitize_callback' => array( 'WPVibe_REST', 'sanitize_file_content' ) ),
+				'replace_all' => array( 'type' => 'boolean', 'required' => false, 'default' => false ),
+				'whole_word'  => array( 'type' => 'boolean', 'required' => false, 'default' => false ),
+			),
+		) );
+
+		register_rest_route( $namespace, '/content/search', array(
+			'methods'             => 'POST',
+			'callback'            => array( $this, 'search_content' ),
+			'permission_callback' => array( $this, 'can_edit_content' ),
+			'args'                => array(
+				'target_type'    => array(
+					'type'              => 'string',
+					'required'          => true,
+					'enum'              => array( 'post', 'meta', 'option' ),
+					'sanitize_callback' => 'sanitize_key',
+				),
+				'post_id'        => array( 'type' => 'integer', 'required' => false ),
+				'field'          => array( 'type' => 'string', 'required' => false, 'sanitize_callback' => 'sanitize_key' ),
+				'meta_key'       => array( 'type' => 'string', 'required' => false, 'sanitize_callback' => 'sanitize_text_field' ),
+				'option_name'    => array( 'type' => 'string', 'required' => false, 'sanitize_callback' => 'sanitize_text_field' ),
+				'pattern'        => array( 'type' => 'string', 'required' => true, 'sanitize_callback' => array( 'WPVibe_REST', 'sanitize_file_content' ) ),
+				'case_sensitive' => array( 'type' => 'boolean', 'required' => false ),
+				'max_results'    => array( 'type' => 'integer', 'required' => false ),
+			),
+		) );
+
 		// --- Draft theme lifecycle ---
 
 		register_rest_route( $namespace, '/draft-theme', array(
@@ -559,6 +604,23 @@ class WPVibe_REST {
 		return current_user_can( 'manage_options' );
 	}
 
+	/**
+	 * Content edit/search — capability depends on the target. Options carry
+	 * site-wide config (and can hold secrets), so they need manage_options;
+	 * post + meta edits require edit-access to the specific post.
+	 */
+	public function can_edit_content( $request ) {
+		$type = $request->get_param( 'target_type' );
+		if ( 'option' === $type ) {
+			return current_user_can( 'manage_options' );
+		}
+		$post_id = (int) $request->get_param( 'post_id' );
+		if ( $post_id > 0 ) {
+			return current_user_can( 'edit_post', $post_id );
+		}
+		return current_user_can( 'edit_posts' );
+	}
+
 	// ------------------------------------------------------------------
 	// Site Info
 	// ------------------------------------------------------------------
@@ -619,6 +681,15 @@ class WPVibe_REST {
 		) );
 	}
 
+	/**
+	 * Capability flags the MCP keys off to decide whether a route is available
+	 * before steering the AI to it. Prefer adding a flag here over forcing the
+	 * MCP to compare WPVIBE_VERSION strings — flags are forward-compatible.
+	 */
+	public static function feature_flags() {
+		return array( 'content_edit', 'content_search' );
+	}
+
 	public function get_site_info() {
 		$theme     = wp_get_theme();
 		$theme_dir = $theme->get_stylesheet_directory();
@@ -650,6 +721,7 @@ class WPVibe_REST {
 			'wp_version'   => get_bloginfo( 'version' ),
 			'php_version'  => phpversion(),
 			'wpvibe_plugin_version' => defined( 'WPVIBE_VERSION' ) ? WPVIBE_VERSION : '',
+			'features'     => self::feature_flags(),
 			'active_theme' => array(
 				'name'              => $theme->get( 'Name' ),
 				'stylesheet'        => get_stylesheet(),
@@ -664,6 +736,51 @@ class WPVibe_REST {
 			'wp_cli_available' => $cli_status['available'],
 			'wp_cli_version'   => $cli_status['version'] ?? null,
 		) );
+	}
+
+	// ------------------------------------------------------------------
+	// Content Operations (delegated to WPVibe_Content_Ops)
+	// ------------------------------------------------------------------
+
+	/** Build the {type, args} pair the content ops expect from request params. */
+	private function content_target( $request ) {
+		$type = $request->get_param( 'target_type' );
+		switch ( $type ) {
+			case 'post':
+				return array( $type, array( 'post_id' => (int) $request->get_param( 'post_id' ), 'field' => $request->get_param( 'field' ) ) );
+			case 'meta':
+				return array( $type, array( 'post_id' => (int) $request->get_param( 'post_id' ), 'key' => $request->get_param( 'meta_key' ) ) );
+			case 'option':
+				return array( $type, array( 'name' => $request->get_param( 'option_name' ) ) );
+			default:
+				return array( $type, array() );
+		}
+	}
+
+	public function edit_content( $request ) {
+		list( $type, $args ) = $this->content_target( $request );
+		$content_ops = new WPVibe_Content_Ops();
+		return $content_ops->edit(
+			$type,
+			$args,
+			$request->get_param( 'old_content' ),
+			$request->get_param( 'new_content' ),
+			(bool) $request->get_param( 'replace_all' ),
+			(bool) $request->get_param( 'whole_word' )
+		);
+	}
+
+	public function search_content( $request ) {
+		list( $type, $args ) = $this->content_target( $request );
+		$max = $request->get_param( 'max_results' );
+		$content_ops = new WPVibe_Content_Ops();
+		return $content_ops->search(
+			$type,
+			$args,
+			$request->get_param( 'pattern' ),
+			(bool) $request->get_param( 'case_sensitive' ),
+			null === $max ? 50 : (int) $max
+		);
 	}
 
 	// ------------------------------------------------------------------

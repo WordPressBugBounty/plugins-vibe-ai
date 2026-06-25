@@ -47,6 +47,7 @@ class WPVibe_Ping {
 			'plugin'         => 'wpvibe',
 			'plugin_version' => defined( 'WPVIBE_VERSION' ) ? WPVIBE_VERSION : '',
 			'wp_version'     => get_bloginfo( 'version' ),
+			'features'       => class_exists( 'WPVibe_REST' ) ? WPVibe_REST::feature_flags() : array(),
 		) );
 	}
 }

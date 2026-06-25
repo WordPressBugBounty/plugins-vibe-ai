@@ -4,7 +4,7 @@ Tags: mcp, mcp-server, claude, chatgpt, ai-assistant
 Requires at least: 6.0
 Tested up to: 7.0
 Requires PHP: 7.4
-Stable tag: 1.4.0
+Stable tag: 1.5.0
 License: GPL-2.0-or-later
 License URI: https://www.gnu.org/licenses/gpl-2.0.html
 
@@ -190,6 +190,16 @@ Vibe AI has multiple safety layers: draft theme isolation for file editing, file
 No. Vibe AI lets you manage your WordPress site entirely through conversation with your AI assistant. No coding required for content management. Theme editing is also conversational, your AI writes the code for your WordPress theme.
 
 == Changelog ==
+
+= 1.5.0 =
+* Feature: Surgical content edits. WPVibe can now make targeted find-and-replace changes to a post's content, excerpt, or title, to post meta, and to site options without rewriting the whole value. Two new endpoints (content search and content edit) locate the exact text first and then replace a single match (or all matches), so large posts no longer have to round-trip through the AI in full. Serialized values are refused so they cannot be corrupted.
+* Feature: Bulk cleanup commands. The post update, post delete, user delete, and plugin uninstall commands now accept several targets in one call, so the AI can tidy up a batch of posts, users, or plugins in a single step.
+* Feature: Approval previews now list every affected item. When an irreversible action touches more than one target (permanently deleting posts, deleting users, uninstalling plugins), the confirmation screen enumerates each one so you can review the full list before approving. Reversible actions (moving posts to trash, updating posts) continue to run without interruption.
+* Hardening: Clearer database change previews. Update queries now show a sample of the rows that will change (previously only deletes did), and long values are trimmed in the preview so a wide table stays readable.
+* Hardening: The approval gate for direct SQL now also covers REPLACE, CREATE, RENAME, and GRANT/REVOKE statements, so those route through the same human confirmation as other database writes.
+* Fix: Frontend edit affordances now render only for registered WPVibe fields/settings, preventing accidental edit markers on unrelated template attributes.
+* Fix: Classic starter theme front-page hero fields now resolve against the configured static front page, so the hover-to-edit links point to the correct page fields.
+* Maintenance: Classic starter theme declares responsive-embeds support so embedded media scales correctly on mobile.
 
 = 1.4.0 =
 * Feature: Field API for theme authors — register editable custom fields and global settings from a theme's `functions.php` via `wpvibe_field_register()`, `wpvibe_setting_register()`, and `wpvibe_field_group_register()`. The plugin handles admin meta box rendering, save handlers, and sanitization across 12 field types (text, textarea, number, email, url, date, checkbox, color, image, gallery, wysiwyg, post_select, repeater). Templates read native `get_option()` / `get_post_meta()` so they keep rendering when the plugin is deactivated.

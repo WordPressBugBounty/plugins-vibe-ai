@@ -59,16 +59,16 @@ class WPVibe_CLI {
 		'plugin deactivate'    => array( 'tier' => 'write', 'cap' => 'activate_plugins' ),
 		'plugin install'       => array( 'tier' => 'write', 'cap' => 'install_plugins', 'check_file_mods' => true ),
 		'plugin update'        => array( 'tier' => 'write', 'cap' => 'update_plugins', 'check_file_mods' => true ),
-		'plugin uninstall'     => array( 'tier' => 'write', 'cap' => 'delete_plugins', 'check_file_mods' => true, 'destructive' => true ),
+		'plugin uninstall'     => array( 'tier' => 'write', 'cap' => 'delete_plugins', 'check_file_mods' => true, 'destructive' => true, 'bulk' => array( 'label' => 'plugin' ) ),
 		'option update'        => array( 'tier' => 'write', 'cap' => 'manage_options' ),
 		'option add'           => array( 'tier' => 'write', 'cap' => 'manage_options' ),
 		'option delete'        => array( 'tier' => 'write', 'cap' => 'manage_options' ),
 		'transient delete'     => array( 'tier' => 'write', 'cap' => 'manage_options' ),
 		'transient list'       => array( 'tier' => 'read',  'cap' => 'manage_options' ),
-		'user delete'          => array( 'tier' => 'write', 'cap' => 'delete_users', 'destructive' => true ),
+		'user delete'          => array( 'tier' => 'write', 'cap' => 'delete_users', 'destructive' => true, 'bulk' => array( 'label' => 'user' ) ),
 		'post create'          => array( 'tier' => 'write', 'cap' => 'edit_posts' ),
 		'post update'          => array( 'tier' => 'write', 'cap' => 'edit_posts' ),
-		'post delete'          => array( 'tier' => 'write', 'cap' => 'delete_posts' ),
+		'post delete'          => array( 'tier' => 'write', 'cap' => 'delete_posts', 'bulk' => array( 'label' => 'post' ) ),
 		'post meta update'     => array( 'tier' => 'write', 'cap' => 'edit_posts' ),
 		'post meta delete'     => array( 'tier' => 'write', 'cap' => 'edit_posts' ),
 		'cache flush'          => array( 'tier' => 'write', 'cap' => 'manage_options' ),
@@ -328,7 +328,35 @@ class WPVibe_CLI {
 			}
 		}
 
-		// Unconditionally destructive: user delete, plugin uninstall.
+		// Gate on irreversibility, not count. Reversible ops run freely at any
+		// scale — a trash (post delete) is restorable, and post update keeps a
+		// WordPress revision. Only irreversible ops confirm: user delete and
+		// plugin uninstall (no trash analog), and post delete --force (bypasses
+		// trash, permanent). When an irreversible op names several targets,
+		// enumerate them so one approval shows the full list. Three explicit IDs
+		// is not "bulk" — the trigger is permanence, not how many.
+		$force_delete = ( 'post delete' === $command_key && ! empty( $flags['force'] ) );
+		if ( ( ! empty( $meta['destructive'] ) || $force_delete ) && ! empty( $meta['bulk'] ) ) {
+			$offset  = isset( $meta['bulk']['offset'] ) ? (int) $meta['bulk']['offset'] : 0;
+			$targets = array_slice( $positional, $offset );
+			if ( count( $targets ) > 1 ) {
+				// Force-delete shares an operation prefix across single + bulk so a
+				// session bypass (post_delete_force:*) covers both forms.
+				$prefix = $force_delete ? 'post_delete_force' : $command_key;
+				$reason = $force_delete
+					/* translators: %d: number of posts */
+					? sprintf( __( 'Permanently deletes %d posts, bypassing trash — they cannot be restored. Review the list before approving.', 'vibe-ai' ), count( $targets ) )
+					/* translators: 1: command, 2: target count */
+					: sprintf( __( 'Permanently affects %2$d targets via "%1$s" and cannot be undone. Review the list before approving.', 'vibe-ai' ), $command_key, count( $targets ) );
+				return array(
+					'operation' => $prefix . ':bulk:' . implode( ',', $targets ),
+					'reason'    => $reason,
+					'dry_run'   => $this->build_bulk_dry_run( $command_key, $meta['bulk'], $targets, $flags ),
+				);
+			}
+		}
+
+		// Single-target unconditionally-destructive: user delete, plugin uninstall.
 		if ( ! empty( $meta['destructive'] ) ) {
 			return array(
 				'operation' => $command_key . ':' . ( $positional[0] ?? '?' ),
@@ -337,7 +365,9 @@ class WPVibe_CLI {
 			);
 		}
 
-		// db query: mutating SQL is destructive (DELETE/UPDATE/DROP/TRUNCATE/ALTER/INSERT).
+		// db query: mutating SQL needs approval. Bare-word verbs, plus REPLACE
+		// matched only as a statement so the REPLACE() string function inside a
+		// read-only SELECT is not misread as a write.
 		if ( 'db query' === $command_key ) {
 			$sql = trim( implode( ' ', $positional ) );
 			if ( '' === $sql ) {
@@ -346,19 +376,27 @@ class WPVibe_CLI {
 			$stripped   = preg_replace( '/--.*$/m', '', $sql );
 			$stripped   = preg_replace( '/\/\*.*?\*\//s', '', $stripped );
 			$normalized = preg_replace( '/\s+/', ' ', strtoupper( trim( $stripped ) ) );
-			$mutating   = array( 'DELETE', 'UPDATE', 'DROP', 'TRUNCATE', 'ALTER', 'INSERT' );
+			$mutating   = array( 'DELETE', 'UPDATE', 'DROP', 'TRUNCATE', 'ALTER', 'INSERT', 'CREATE', 'RENAME', 'GRANT', 'REVOKE' );
+			$matched    = null;
 			foreach ( $mutating as $kw ) {
 				if ( preg_match( '/\b' . $kw . '\b/', $normalized ) ) {
-					return array(
-						'operation' => 'db_query_' . strtolower( $kw ),
-						'reason'    => sprintf(
-							/* translators: %s: SQL keyword */
-							__( 'Mutating SQL (%s) bypasses all plugin safety. Direct DB writes need explicit approval.', 'vibe-ai' ),
-							$kw
-						),
-						'dry_run'   => $this->build_db_query_dry_run( $kw, $sql, $normalized ),
-					);
+					$matched = $kw;
+					break;
 				}
+			}
+			if ( null === $matched && preg_match( '/\bREPLACE\s+(?:LOW_PRIORITY\s+|DELAYED\s+)?INTO\b/', $normalized ) ) {
+				$matched = 'REPLACE';
+			}
+			if ( null !== $matched ) {
+				return array(
+					'operation' => 'db_query_' . strtolower( $matched ),
+					'reason'    => sprintf(
+						/* translators: %s: SQL keyword */
+						__( 'Mutating SQL (%s) bypasses all plugin safety. Direct DB writes need explicit approval.', 'vibe-ai' ),
+						$matched
+					),
+					'dry_run'   => $this->build_db_query_dry_run( $matched, $sql, $normalized ),
+				);
 			}
 			return null;
 		}
@@ -445,6 +483,74 @@ class WPVibe_CLI {
 		return array( 'command' => $command_key, 'positional' => $positional, 'flags' => $flags );
 	}
 
+	/**
+	 * Build the enumerated preview for a bulk op. Generic across target types
+	 * (post / user / plugin); the per-target labeling lives in describe_target.
+	 * Capped so a 5,000-id bulk doesn't produce a 5,000-row preview.
+	 */
+	private function build_bulk_dry_run( $command_key, $bulk_meta, $targets, $flags ) {
+		$type = isset( $bulk_meta['label'] ) ? $bulk_meta['label'] : 'item';
+		$cap  = 100;
+		$enum = array();
+		foreach ( array_slice( $targets, 0, $cap ) as $t ) {
+			$enum[] = $this->describe_target( $type, $t );
+		}
+
+		$dry = array(
+			'command'           => 'wp ' . $command_key . ( ! empty( $flags['force'] ) ? ' --force' : '' ),
+			'count'             => count( $targets ),
+			'targets'           => $enum,
+			'targets_truncated' => count( $targets ) > $cap,
+		);
+
+		if ( 'post delete' === $command_key ) {
+			$dry['note'] = ! empty( $flags['force'] )
+				? __( '--force permanently deletes these posts (no trash, not restorable).', 'vibe-ai' )
+				: __( 'Posts move to trash and remain restorable.', 'vibe-ai' );
+		} elseif ( 'post update' === $command_key ) {
+			$changes = array();
+			foreach ( array( 'post_title', 'post_content', 'post_status', 'post_excerpt', 'post_name', 'post_parent', 'menu_order', 'comment_status', 'post_type' ) as $field ) {
+				if ( isset( $flags[ $field ] ) ) {
+					$changes[ $field ] = $flags[ $field ];
+				}
+			}
+			$dry['changes'] = $changes;
+		} elseif ( 'user delete' === $command_key && ! empty( $flags['reassign'] ) ) {
+			$dry['reassign_to'] = $flags['reassign'];
+		}
+
+		return $dry;
+	}
+
+	/** Resolve a single bulk target to a human-reviewable descriptor by type. */
+	private function describe_target( $type, $t ) {
+		switch ( $type ) {
+			case 'post':
+				$post = get_post( (int) $t );
+				return $post
+					? array( 'id' => (int) $t, 'title' => get_the_title( $post ), 'type' => $post->post_type, 'status' => $post->post_status )
+					: array( 'id' => (int) $t, 'note' => __( 'not found', 'vibe-ai' ) );
+			case 'user':
+				$user = is_numeric( $t )
+					? get_user_by( 'id', (int) $t )
+					: ( is_email( $t ) ? get_user_by( 'email', $t ) : get_user_by( 'login', $t ) );
+				return $user
+					? array( 'target' => $user->user_login, 'id' => (int) $user->ID, 'email' => $user->user_email, 'roles' => $user->roles, 'authored_posts' => (int) count_user_posts( $user->ID ) )
+					: array( 'target' => $t, 'note' => __( 'not found', 'vibe-ai' ) );
+			case 'plugin':
+				$file = $this->resolve_plugin_file( $t );
+				if ( ! function_exists( 'get_plugins' ) ) {
+					require_once ABSPATH . 'wp-admin/includes/plugin.php';
+				}
+				$all = get_plugins();
+				return ( $file && isset( $all[ $file ] ) )
+					? array( 'target' => $t, 'name' => $all[ $file ]['Name'], 'version' => $all[ $file ]['Version'], 'active' => is_plugin_active( $file ) )
+					: array( 'target' => $t, 'note' => __( 'not found', 'vibe-ai' ) );
+			default:
+				return array( 'target' => $t );
+		}
+	}
+
 	private function build_db_query_dry_run( $keyword, $sql, $normalized ) {
 		global $wpdb;
 		// Resolve {prefix} placeholder so the regex parsers below can find the
@@ -482,7 +588,7 @@ class WPVibe_CLI {
 				// phpcs:ignore WordPress.DB.PreparedSQL.NotPrepared, WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
 				$sample = $wpdb->get_results( $sample_sql, ARRAY_A ); // nosemgrep: direct-db-query
 				if ( $sample && empty( $wpdb->last_error ) ) {
-					$preview['sample_rows'] = $sample;
+					$preview['sample_rows'] = $this->trim_sample_rows( $sample );
 				}
 			} else {
 				$preview['note'] = __( 'Could not preview affected rows (SQL parse failure). Execution will attempt the literal DELETE.', 'vibe-ai' );
@@ -503,12 +609,49 @@ class WPVibe_CLI {
 					/* translators: %d: row-count cap */
 					$preview['affected_count_note']      = sprintf( __( 'Count truncated at %d to avoid scanning very large tables; actual affected rows may be higher.', 'vibe-ai' ), $cap );
 				}
+				// Show which rows will change (current values) so the approval is
+				// reviewable by content, not just by count — same as the DELETE branch.
+				$sample_sql = "SELECT * FROM `{$table}` {$where} LIMIT 5";
+				// phpcs:ignore WordPress.DB.PreparedSQL.NotPrepared, WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
+				$sample = $wpdb->get_results( $sample_sql, ARRAY_A ); // nosemgrep: direct-db-query
+				if ( $sample && empty( $wpdb->last_error ) ) {
+					$preview['sample_rows'] = $this->trim_sample_rows( $sample );
+				}
 			} else {
 				$preview['note'] = __( 'Could not preview affected rows (SQL parse failure). Execution will attempt the literal UPDATE.', 'vibe-ai' );
 			}
 		}
 
 		return $preview;
+	}
+
+	/**
+	 * Truncate long string values in dry-run sample rows so a preview of a wide
+	 * table (e.g. wp_posts.post_content, wp_options.option_value) stays readable
+	 * instead of dumping full bodies. Table-agnostic: trims any string cell over
+	 * the cap, leaving short identifying columns (ID, title, status) intact.
+	 *
+	 * @param array $rows Rows from $wpdb->get_results( ..., ARRAY_A ).
+	 * @param int   $max  Max characters per string cell.
+	 * @return array
+	 */
+	private function trim_sample_rows( $rows, $max = 200 ) {
+		if ( ! is_array( $rows ) ) {
+			return $rows;
+		}
+		foreach ( $rows as &$row ) {
+			if ( ! is_array( $row ) ) {
+				continue;
+			}
+			foreach ( $row as $key => $val ) {
+				if ( is_string( $val ) && mb_strlen( $val ) > $max ) {
+					/* translators: %d: total character count of the truncated value */
+					$row[ $key ] = mb_substr( $val, 0, $max ) . sprintf( __( '... [truncated, %d chars total]', 'vibe-ai' ), mb_strlen( $val ) );
+				}
+			}
+		}
+		unset( $row );
+		return $rows;
 	}
 
 	// ------------------------------------------------------------------
@@ -1770,16 +1913,7 @@ class WPVibe_CLI {
 
 	private function handle_user_delete( $positional, $flags ) {
 		if ( empty( $positional[0] ) ) {
-			return $this->error_result( __( 'User identifier required. Usage: user delete <id|login|email> [--reassign=<user>]', 'vibe-ai' ) );
-		}
-
-		$ident = $positional[0];
-		$user  = is_numeric( $ident )
-			? get_user_by( 'id', (int) $ident )
-			: ( is_email( $ident ) ? get_user_by( 'email', $ident ) : get_user_by( 'login', $ident ) );
-		if ( ! $user ) {
-			/* translators: %s: user identifier */
-			return $this->error_result( sprintf( __( 'User \'%s\' not found.', 'vibe-ai' ), $ident ) );
+			return $this->error_result( __( 'User identifier required. Usage: user delete <id|login|email> [<id>...] [--reassign=<user>]', 'vibe-ai' ) );
 		}
 
 		$reassign = null;
@@ -1797,61 +1931,112 @@ class WPVibe_CLI {
 		if ( ! function_exists( 'wp_delete_user' ) ) {
 			require_once ABSPATH . 'wp-admin/includes/user.php';
 		}
-		$ok = wp_delete_user( $user->ID, $reassign );
-		if ( ! $ok ) {
-			return $this->error_result( __( 'Failed to delete user.', 'vibe-ai' ) );
+
+		$idents  = $positional;
+		$results = array();
+		$ok      = 0;
+		foreach ( $idents as $ident ) {
+			$user = is_numeric( $ident )
+				? get_user_by( 'id', (int) $ident )
+				: ( is_email( $ident ) ? get_user_by( 'email', $ident ) : get_user_by( 'login', $ident ) );
+			if ( ! $user ) {
+				$results[] = array( 'target' => $ident, 'status' => 'error', 'error' => 'not found' );
+				continue;
+			}
+			if ( wp_delete_user( $user->ID, $reassign ) ) {
+				$ok++;
+				$results[] = array( 'target' => $user->user_login, 'id' => $user->ID, 'status' => 'deleted' );
+			} else {
+				$results[] = array( 'target' => $user->user_login, 'id' => $user->ID, 'status' => 'error', 'error' => 'delete failed' );
+			}
 		}
 
 		WPVibe_Change_Tracker::mark( array(
-			'summary'      => "User deleted: {$user->user_login}",
+			'summary'      => count( $idents ) > 1 ? "Users deleted: {$ok}/" . count( $idents ) : "User deleted: {$results[0]['target']}",
 			'action_label' => 'Manage Users',
 			'admin_url'    => admin_url( 'users.php' ),
 		) );
 
+		if ( 1 === count( $idents ) ) {
+			$only = $results[0];
+			if ( 'error' === $only['status'] ) {
+				/* translators: 1: user identifier, 2: error message */
+				return $this->error_result( sprintf( __( 'User \'%1$s\': %2$s', 'vibe-ai' ), $only['target'], $only['error'] ) );
+			}
+			return $this->success_result( array(
+				/* translators: 1: user login, 2: user ID */
+				'message'       => sprintf( __( 'Deleted user \'%1$s\' (#%2$d).', 'vibe-ai' ), $only['target'], $only['id'] ),
+				'reassigned_to' => $reassign,
+			) );
+		}
+
 		return $this->success_result( array(
-			/* translators: 1: user login, 2: user ID */
-			'message'        => sprintf( __( 'Deleted user \'%1$s\' (#%2$d).', 'vibe-ai' ), $user->user_login, $user->ID ),
-			'reassigned_to'  => $reassign,
+			/* translators: 1: success count, 2: total */
+			'message'       => sprintf( __( 'Deleted %1$d of %2$d users.', 'vibe-ai' ), $ok, count( $idents ) ),
+			'succeeded'     => $ok,
+			'total'         => count( $idents ),
+			'reassigned_to' => $reassign,
+			'results'       => $results,
 		) );
 	}
 
 	private function handle_plugin_uninstall( $positional, $flags ) {
 		if ( empty( $positional[0] ) ) {
-			return $this->error_result( __( 'Plugin slug required. Usage: plugin uninstall <slug>', 'vibe-ai' ) );
-		}
-
-		$slug = $positional[0];
-		$file = $this->resolve_plugin_file( $slug );
-		if ( ! $file ) {
-			/* translators: %s: plugin slug */
-			return $this->error_result( sprintf( __( 'Plugin \'%s\' not found.', 'vibe-ai' ), $slug ) );
+			return $this->error_result( __( 'Plugin slug required. Usage: plugin uninstall <slug> [<slug>...]', 'vibe-ai' ) );
 		}
 
 		if ( ! function_exists( 'delete_plugins' ) ) {
 			require_once ABSPATH . 'wp-admin/includes/plugin.php';
 		}
 
-		// Deactivate first if active.
-		if ( is_plugin_active( $file ) ) {
-			deactivate_plugins( $file );
-		}
-
-		$result = delete_plugins( array( $file ) );
-		if ( is_wp_error( $result ) ) {
-			return $this->error_result( $result->get_error_message() );
-		}
-		if ( false === $result ) {
-			return $this->error_result( __( 'Failed to uninstall plugin (filesystem or WP_Filesystem error).', 'vibe-ai' ) );
+		$slugs   = $positional;
+		$results = array();
+		$ok      = 0;
+		foreach ( $slugs as $slug ) {
+			$file = $this->resolve_plugin_file( $slug );
+			if ( ! $file ) {
+				$results[] = array( 'target' => $slug, 'status' => 'error', 'error' => 'not found' );
+				continue;
+			}
+			if ( is_plugin_active( $file ) ) {
+				deactivate_plugins( $file );
+			}
+			$result = delete_plugins( array( $file ) );
+			if ( is_wp_error( $result ) ) {
+				$results[] = array( 'target' => $slug, 'status' => 'error', 'error' => $result->get_error_message() );
+				continue;
+			}
+			if ( false === $result ) {
+				$results[] = array( 'target' => $slug, 'status' => 'error', 'error' => 'filesystem error' );
+				continue;
+			}
+			$ok++;
+			$results[] = array( 'target' => $slug, 'status' => 'uninstalled' );
 		}
 
 		WPVibe_Change_Tracker::mark( array(
-			'summary'      => "Plugin uninstalled: {$slug}",
+			'summary'      => count( $slugs ) > 1 ? "Plugins uninstalled: {$ok}/" . count( $slugs ) : "Plugin uninstalled: {$slugs[0]}",
 			'action_label' => 'Manage Plugins',
 			'admin_url'    => admin_url( 'plugins.php' ),
 		) );
 
-		/* translators: %s: plugin slug */
-		return $this->success_result( array( 'message' => sprintf( __( 'Plugin \'%s\' uninstalled.', 'vibe-ai' ), $slug ) ) );
+		if ( 1 === count( $slugs ) ) {
+			$only = $results[0];
+			if ( 'error' === $only['status'] ) {
+				/* translators: 1: plugin slug, 2: error message */
+				return $this->error_result( sprintf( __( 'Plugin \'%1$s\': %2$s', 'vibe-ai' ), $only['target'], $only['error'] ) );
+			}
+			/* translators: %s: plugin slug */
+			return $this->success_result( array( 'message' => sprintf( __( 'Plugin \'%s\' uninstalled.', 'vibe-ai' ), $slugs[0] ) ) );
+		}
+
+		return $this->success_result( array(
+			/* translators: 1: success count, 2: total */
+			'message'   => sprintf( __( 'Uninstalled %1$d of %2$d plugins.', 'vibe-ai' ), $ok, count( $slugs ) ),
+			'succeeded' => $ok,
+			'total'     => count( $slugs ),
+			'results'   => $results,
+		) );
 	}
 
 	/**
@@ -1950,86 +2135,89 @@ class WPVibe_CLI {
 	}
 
 	private function handle_post_update( $positional, $flags ) {
-		if ( empty( $positional[0] ) ) {
-			return $this->error_result( __( 'Post ID required. Usage: post update <id> --post_title="New Title"', 'vibe-ai' ) );
+		$ids = $this->positional_ids( $positional );
+		if ( empty( $ids ) ) {
+			return $this->error_result( __( 'Post ID required. Usage: post update <id> [<id>...] --post_title="New Title"', 'vibe-ai' ) );
 		}
 
-		$post_id = (int) $positional[0];
-		$post    = get_post( $post_id );
-		if ( ! $post ) {
-			/* translators: %s: post ID */
-			return $this->error_result( sprintf( __( 'Post %s not found.', 'vibe-ai' ), $positional[0] ) );
-		}
-
-		$args = array( 'ID' => $post_id );
 		$updatable = array( 'post_title', 'post_content', 'post_status', 'post_excerpt',
 			'post_name', 'post_parent', 'menu_order', 'comment_status', 'post_type' );
+		$fields = array();
 		foreach ( $updatable as $field ) {
 			if ( isset( $flags[ $field ] ) ) {
-				$args[ $field ] = $flags[ $field ];
+				$fields[ $field ] = $flags[ $field ];
 			}
 		}
-
-		if ( count( $args ) < 2 ) {
+		if ( empty( $fields ) ) {
 			return $this->error_result( __( 'No fields to update. Use flags like --post_title, --post_content, --post_status.', 'vibe-ai' ) );
 		}
 
-		$cap_check = $this->check_post_caps( $post->post_type, 'update', $post_id, $args['post_status'] ?? null );
-		if ( is_wp_error( $cap_check ) ) {
-			return $this->error_result( $cap_check->get_error_message() );
-		}
-
-		$result = wp_update_post( $args, true );
-		if ( is_wp_error( $result ) ) {
-			return $this->error_result( $result->get_error_message() );
+		$results = array();
+		$ok      = 0;
+		foreach ( $ids as $post_id ) {
+			$post = get_post( $post_id );
+			if ( ! $post ) {
+				$results[] = array( 'id' => $post_id, 'status' => 'error', 'error' => 'not found' );
+				continue;
+			}
+			$cap_check = $this->check_post_caps( $post->post_type, 'update', $post_id, $fields['post_status'] ?? null );
+			if ( is_wp_error( $cap_check ) ) {
+				$results[] = array( 'id' => $post_id, 'status' => 'error', 'error' => $cap_check->get_error_message() );
+				continue;
+			}
+			$res = wp_update_post( array_merge( array( 'ID' => $post_id ), $fields ), true );
+			if ( is_wp_error( $res ) ) {
+				$results[] = array( 'id' => $post_id, 'status' => 'error', 'error' => $res->get_error_message() );
+				continue;
+			}
+			$ok++;
+			$results[] = array( 'id' => $post_id, 'status' => 'updated' );
 		}
 
 		WPVibe_Change_Tracker::mark( array(
-			'summary'      => "Post updated: #{$post_id}",
-			'action_label' => 'Edit Post',
-			'admin_url'    => admin_url( "post.php?post={$post_id}&action=edit" ),
+			'summary'      => count( $ids ) > 1 ? "Posts updated: {$ok}/" . count( $ids ) : "Post updated: #{$ids[0]}",
+			'action_label' => 'Refresh',
 		) );
 
-		/* translators: %d: post ID */
-		return $this->success_result( array( 'message' => sprintf( __( 'Updated post #%d.', 'vibe-ai' ), $post_id ) ) );
+		return $this->bulk_result( 'updated', $ok, $ids, $results );
 	}
 
 	private function handle_post_delete( $positional, $flags ) {
-		if ( empty( $positional[0] ) ) {
-			return $this->error_result( __( 'Post ID required.', 'vibe-ai' ) );
+		$ids = $this->positional_ids( $positional );
+		if ( empty( $ids ) ) {
+			return $this->error_result( __( 'Post ID required. Usage: post delete <id> [<id>...] [--force]', 'vibe-ai' ) );
 		}
 
-		$post_id = (int) $positional[0];
-		$post    = get_post( $post_id );
-		if ( ! $post ) {
-			/* translators: %s: post ID */
-			return $this->error_result( sprintf( __( 'Post %s not found.', 'vibe-ai' ), $positional[0] ) );
-		}
-
-		$cap_check = $this->check_post_caps( $post->post_type, 'delete', $post_id );
-		if ( is_wp_error( $cap_check ) ) {
-			return $this->error_result( $cap_check->get_error_message() );
-		}
-
-		$force = ! empty( $flags['force'] );
-		if ( $force ) {
-			$result = wp_delete_post( $post_id, true );
-		} else {
-			$result = wp_trash_post( $post_id );
-		}
-
-		if ( ! $result ) {
-			return $this->error_result( __( 'Failed to delete post.', 'vibe-ai' ) );
+		$force   = ! empty( $flags['force'] );
+		$results = array();
+		$ok      = 0;
+		foreach ( $ids as $post_id ) {
+			$post = get_post( $post_id );
+			if ( ! $post ) {
+				$results[] = array( 'id' => $post_id, 'status' => 'error', 'error' => 'not found' );
+				continue;
+			}
+			$cap_check = $this->check_post_caps( $post->post_type, 'delete', $post_id );
+			if ( is_wp_error( $cap_check ) ) {
+				$results[] = array( 'id' => $post_id, 'status' => 'error', 'error' => $cap_check->get_error_message() );
+				continue;
+			}
+			$res = $force ? wp_delete_post( $post_id, true ) : wp_trash_post( $post_id );
+			if ( ! $res ) {
+				$results[] = array( 'id' => $post_id, 'status' => 'error', 'error' => 'delete failed' );
+				continue;
+			}
+			$ok++;
+			$results[] = array( 'id' => $post_id, 'status' => $force ? 'deleted' : 'trashed' );
 		}
 
 		$action = $force ? __( 'permanently deleted', 'vibe-ai' ) : __( 'trashed', 'vibe-ai' );
 		WPVibe_Change_Tracker::mark( array(
-			'summary'      => "Post {$action}: #{$post_id}",
+			'summary'      => count( $ids ) > 1 ? "Posts {$action}: {$ok}/" . count( $ids ) : "Post {$action}: #{$ids[0]}",
 			'action_label' => 'Refresh',
 		) );
 
-		/* translators: 1: post ID, 2: action taken (trashed or permanently deleted) */
-		return $this->success_result( array( 'message' => sprintf( __( 'Post #%1$d %2$s.', 'vibe-ai' ), $post_id, $action ) ) );
+		return $this->bulk_result( $action, $ok, $ids, $results );
 	}
 
 	private function handle_post_meta_update( $positional, $flags ) {
@@ -2259,6 +2447,38 @@ class WPVibe_CLI {
 			'stdout'    => wp_json_encode( $data, JSON_PRETTY_PRINT ),
 			'stderr'    => '',
 		);
+	}
+
+	/** Positive integer IDs from positional args, deduped, order-preserved. */
+	private function positional_ids( $positional ) {
+		$ids = array();
+		foreach ( (array) $positional as $p ) {
+			if ( is_numeric( $p ) && (int) $p > 0 ) {
+				$ids[] = (int) $p;
+			}
+		}
+		return array_values( array_unique( $ids ) );
+	}
+
+	/** Shape a single- or multi-target post op response consistently. */
+	private function bulk_result( $action, $ok, $ids, $results ) {
+		$total = count( $ids );
+		if ( 1 === $total ) {
+			$only = $results[0];
+			if ( isset( $only['status'] ) && 'error' === $only['status'] ) {
+				/* translators: 1: post ID, 2: error message */
+				return $this->error_result( sprintf( __( 'Post #%1$d: %2$s', 'vibe-ai' ), $only['id'], $only['error'] ) );
+			}
+			/* translators: 1: post ID, 2: action taken */
+			return $this->success_result( array( 'message' => sprintf( __( 'Post #%1$d %2$s.', 'vibe-ai' ), $ids[0], $action ) ) );
+		}
+		return $this->success_result( array(
+			/* translators: 1: success count, 2: total, 3: action taken */
+			'message'   => sprintf( __( '%1$d of %2$d posts %3$s.', 'vibe-ai' ), $ok, $total, $action ),
+			'succeeded' => $ok,
+			'total'     => $total,
+			'results'   => $results,
+		) );
 	}
 
 	private function error_result( $message, $exit_code = 1 ) {

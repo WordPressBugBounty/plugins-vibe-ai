@@ -6,8 +6,8 @@
  * Theme authors annotate elements whose content comes from a registered
  * field by calling wpvibe_edit_attr() (post meta) or
  * wpvibe_edit_setting_attr() (settings) from inside the opening tag. The
- * helpers output a data attribute only for users with the matching
- * capability — anonymous visitors and read-only roles see clean markup.
+ * helpers output a data attribute only for registered fields and users with
+ * the matching capability — anonymous visitors and read-only roles see clean markup.
  *
  * A small frontend bundle (loaded only for users with edit capability)
  * paints a dashed outline + "Edit" pin on hover and links the pin to the
@@ -100,8 +100,8 @@ class WPVibe_Edit_Affordance {
 
 /**
  * Emit a data attribute marking an element as editable. Outputs nothing
- * for users without edit_post capability on this specific post, so the
- * helper is safe to drop into public-facing templates.
+ * unless the field is registered for this post type and the user can edit
+ * this specific post.
  *
  * Usage in a template:
  *   <h1 <?php wpvibe_edit_attr( get_the_ID(), 'hero_heading' ); ?>>
@@ -116,12 +116,17 @@ function wpvibe_edit_attr( $post_id, $key ) {
 	if ( ! $post_id || ! current_user_can( 'edit_post', $post_id ) ) {
 		return;
 	}
+	$post_type = get_post_type( $post_id );
+	if ( ! $post_type || ! WPVibe_Fields::instance()->get_field( $post_type, $key ) ) {
+		return;
+	}
 	printf( ' data-wpvibe-edit="%d:%s"', $post_id, esc_attr( $key ) );
 }
 
 /**
  * Emit a data attribute marking an element as bound to an editable
- * global setting. Outputs nothing for users without manage_options.
+ * global setting. Outputs nothing unless the setting is registered and the
+ * user can manage options.
  *
  * Usage in a template:
  *   <div <?php wpvibe_edit_setting_attr( 'site_tagline' ); ?>>
@@ -132,6 +137,9 @@ function wpvibe_edit_attr( $post_id, $key ) {
  */
 function wpvibe_edit_setting_attr( $key ) {
 	if ( ! current_user_can( 'manage_options' ) ) {
+		return;
+	}
+	if ( ! WPVibe_Fields::instance()->get_setting( $key ) ) {
 		return;
 	}
 	printf( ' data-wpvibe-edit-setting="%s"', esc_attr( $key ) );
