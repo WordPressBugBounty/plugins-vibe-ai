@@ -4,7 +4,7 @@ Tags: mcp, claude, chatgpt, ai-assistant, mcp-server
 Requires at least: 6.0
 Tested up to: 7.0
 Requires PHP: 7.4
-Stable tag: 1.14.0
+Stable tag: 1.14.1
 License: GPL-2.0-or-later
 License URI: https://www.gnu.org/licenses/gpl-2.0.html
 
@@ -230,6 +230,10 @@ Yes. Connected sites are unlimited on every plan, including the free plan. Conne
 No. WPVibe lets you manage your WordPress site entirely through conversation with your AI assistant. No coding required for content management. Theme editing is also conversational, your AI writes the code for your WordPress theme.
 
 == Changelog ==
+
+= 1.14.1 =
+* Improvement: approved operations now leave an execution receipt on your site. If the connection drops right after you click Approve, WPVibe can check the receipt and tell your AI exactly what happened (it ran, it was rejected, or it never arrived) instead of reporting the outcome as unknown.
+* Improvement: an approved operation can never run twice. If the same approved request is ever re-sent, the site returns the recorded result of the first run instead of executing again.
 
 = 1.14.0 =
 * Feature: Bricks support. Your AI can now build and edit Bricks pages through Bricks' own save pipeline, with the theme's element security checks applied and page CSS regenerated on every save (external file mode included). Layouts open in the Bricks editor exactly like hand-built pages.
