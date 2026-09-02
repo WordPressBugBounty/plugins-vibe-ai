@@ -4,7 +4,7 @@ Tags: mcp, claude, chatgpt, ai-assistant, mcp-server
 Requires at least: 6.0
 Tested up to: 7.1
 Requires PHP: 7.4
-Stable tag: 1.16.0
+Stable tag: 1.16.1
 License: GPL-2.0-or-later
 License URI: https://www.gnu.org/licenses/gpl-2.0.html
 
@@ -220,6 +220,12 @@ No. WPVibe lets you manage your WordPress site entirely through conversation wit
 
 == Changelog ==
 
+= 1.16.1 =
+* Fix: uploading a file type WordPress does not allow (or an empty file) now says so, with the extension and where to allow it, instead of reporting a filesystem error that sent people checking folder permissions.
+* Fix: reading a translated page's HTML on a WPML site with language directories now returns that language's page instead of the default one.
+* Feature: the WPVibe row on the Plugins screen explains that deactivating or deleting the plugin does not disconnect the site or revoke its application password, with links to do both, and a confirm on Deactivate says the same before the plugin's code stops running.
+* Fix: `comment create` now applies WordPress's comment filtering for authors who lack the unfiltered_html capability (non-super-admins on multisite, sites with DISALLOW_UNFILTERED_HTML), matching what core does for those users.
+
 = 1.16.0 =
 * Feature: WPVibe can now update itself through your AI assistant. `plugin update vibe-ai` schedules the update to run out-of-band (the same model WordPress core uses), so the connection serving the request is never the one replacing the plugin's files. Where available, WordPress's automatic updater runs it, with its post-update fatal check and rollback for active plugins. Progress and the outcome are recorded in a status option your AI can read back.
 * Feature: `plugin auto-updates enable|disable|status` commands, matching real WP-CLI behavior, so your AI can enroll any plugin (including WPVibe) in WordPress auto-updates. Also fixes auto-update enrollment on multisite, where the setting lives in a network option.
@@ -235,6 +241,11 @@ No. WPVibe lets you manage your WordPress site entirely through conversation wit
 * Fix: operation receipts now accept the fleet runner's operation ids, so background jobs can recover the outcome of a call that timed out mid-flight instead of re-probing.
 * Feature: `core update` and `core update-db`. Updating WordPress core pauses for browser approval and shows the exact version change; the approval is re-verified against the site at execution, and a leftover .maintenance file is cleaned up so a failed update cannot strand the site.
 * Fix: when a security plugin filters WordPress core update data, `core check-update` and `core update` now say so instead of reporting "no update available" as a certainty.
+* Fix: Elementor pages saved through WPVibe are verified after the save. If Elementor stored the layout empty, WPVibe writes the requested structure directly, removes the empty autosave the editor would otherwise open, and never reports success on a page that is still empty.
+* Fix: a content edit whose old text differs from the stored value only by whitespace now applies when it is the one unambiguous match, and a miss says what was tried instead of a bare "not found".
+* Hardening: PHP file writes are refused when they would redeclare a function or class the running site already has, and publishing a draft theme renders the front page afterwards and rolls back to the backup on a fatal, keeping the draft for editing.
+* Fix: the Approve click on the connection screen now creates the application password through WPVibe's own route with your logged-in session, so hosts that block the core users endpoint as "user enumeration" no longer stop the one-click connect.
+* Fix: when the connection check fails, the connected page now says what actually came back (a firewall page, a redirect, a server error) and what to do about it, instead of one generic message.
 
 = 1.15.5 =
 * Fix: when WordPress rejects the application password it created seconds earlier, the plugin now reports whether that user has any application passwords stored at all, plus the install facts that explain a lost one (persistent object cache, shared user tables, wp-content drop-ins). WPVibe uses this to say "your site did not keep the password" instead of blaming the host for stripping the Authorization header.
@@ -337,19 +348,6 @@ No. WPVibe lets you manage your WordPress site entirely through conversation wit
 * New: Beaver Builder support. Your AI can now build and edit real Beaver Builder pages, landing pages, and layouts. The result is a native Beaver Builder layout: open it in the builder and every row, column, and module is there and individually editable, exactly as if you built it by hand. Works with both the free Beaver Builder (Lite) and the paid plugin.
 * New: Beaver Themer support. Build site-wide headers and footers (navigation menus included), plus archive, 404, and single-post layouts, each wired to the right location rules. Themer headers and footers need a Themer-compatible theme (the Beaver Builder Theme, Astra, GeneratePress, Kadence, and similar); WPVibe tells you up front when the active theme cannot render one instead of leaving a layout that shows nowhere.
 * New: "post meta add" appends a row to multi-value post meta, and "post meta delete" accepts an optional value to remove only the matching row. Previously update replaced every row of a key and delete wiped them all, which made multi-value metas effectively untouchable. Divi's Theme Builder links its templates through exactly this kind of meta, so your AI can now add a second Theme Builder template without destroying the first.
-
-= 1.9.1 =
-* Fix: uninstalling a plugin, updating a plugin, or deleting a theme through WPVibe no longer fails with a 500 error. These commands ran WordPress's own delete and upgrade functions without first loading wp-admin's filesystem bootstrap, which wp-admin pre-loads but WPVibe's REST context does not. All file-modifying commands now load it up front.
-* New: update several plugins at once. `plugin update` now accepts multiple slugs or `--all` (with `--exclude` and `--dry-run`), previews the full list before you confirm, and reports a per-plugin result. WPVibe itself is skipped automatically, since it cannot replace its own files over its own connection.
-* Fix: Google Site Kit (and other plugins that read the logged-in user early) now see the correct user on WPVibe requests. WordPress resolves Application Password logins later than plugins that initialize on init, so Site Kit read an empty Google authorization and rejected every Analytics, Search Console, and PageSpeed request with missing_required_scopes. WPVibe now tells WordPress that REST requests are API requests from the start, so the login resolves before those plugins load.
-
-= 1.9.0 =
-* New: WPVibe dashboard widget. Your wp-admin Dashboard now shows whether the site is connected, the last few changes your AI made, and a short list of cookbook recipes matched to the plugins you actually run, each with a copy-ready prompt. Not connected yet? The widget gives you the one-line prompt that connects your site.
-* New: recipe suggestions are filtered on your own site against your installed plugins. The widget fetches one small public recipe list from wpvibe.ai (nothing about your site is sent, same pattern as the WordPress Events and News widget) and picks locally.
-* Improvement: recent AI-made changes are now kept in a small activity log (last 10 entries) so the dashboard can show them; the full record remains in the Approval Log.
-
-= 1.8.1 =
-* Fix: SeedProd landing pages now render on your site automatically after WPVibe builds or updates them. The automatic render step added in 1.8.0 only recognized SeedProd theme templates and coming-soon or maintenance pages, so regular landing pages still asked you to open the SeedProd builder and click Save yourself.
 
 = Older versions =
 WP.org caps the changelog at 5,000 words. For the full release history back to 1.0.0, see https://wpvibe.ai/changelog/
