@@ -816,12 +816,17 @@ class WPVibe_Draft_Theme {
 		if ( $update_warning ) {
 			$message .= ' ' . $update_warning;
 		}
+		$seedprod_note = class_exists( 'WPVibe_Preview' ) ? WPVibe_Preview::seedprod_theme_note( true ) : '';
+		if ( '' !== $seedprod_note ) {
+			$message .= ' ' . $seedprod_note;
+		}
 
 		return rest_ensure_response( array_filter( array(
 			'status'               => 'published',
 			'message'              => $message,
 			'saved_customizations' => array_filter( $settled ),
 			'update_warning'       => $update_warning,
+			'seedprod_theme_note'  => $seedprod_note,
 		) ) );
 	}
 
@@ -1110,6 +1115,7 @@ class WPVibe_Draft_Theme {
 			'draft_slug'          => $draft_slug,
 			'live_customizations' => '' !== $source ? self::clashing_customizations( $source, $draft_slug ) : array(),
 			'update_warning'      => '' !== $source ? self::wporg_update_warning( $source, get_theme_root() . '/' . $draft_slug ) : null,
+			'seedprod_theme_note' => class_exists( 'WPVibe_Preview' ) ? WPVibe_Preview::seedprod_theme_note() : '',
 		) ) );
 	}
 

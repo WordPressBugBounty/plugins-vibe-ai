@@ -1,8 +1,8 @@
 <?php
 /**
- * Plugin Name: WPVibe – Connect Your Site to Claude, ChatGPT & AI Assistants
+ * Plugin Name: WPVibe – MCP Server for WordPress, works with Claude, ChatGPT & other AI agents
  * Description: Connect any AI assistant to your WordPress site. Manage content, edit themes, and automate site tasks with Claude, ChatGPT, Cursor & more via MCP.
- * Version: 1.20.3
+ * Version: 1.20.4
  * Author: SeedProd
  * Author URI: https://wpvibe.ai
  * License: GPL-2.0-or-later
@@ -14,7 +14,7 @@
 
 defined( 'ABSPATH' ) || exit;
 
-define( 'WPVIBE_VERSION', '1.20.3' );
+define( 'WPVIBE_VERSION', '1.20.4' );
 define( 'WPVIBE_PLUGIN_DIR', plugin_dir_path( __FILE__ ) );
 define( 'WPVIBE_PLUGIN_URL', plugin_dir_url( __FILE__ ) );
 define( 'WPVIBE_PLUGIN_BASENAME', plugin_basename( __FILE__ ) );
@@ -132,6 +132,9 @@ WPVibe_Authorize_Notice::register();
 
 // Registered at file scope so it precedes the first determine_current_user run.
 add_filter( 'application_password_is_api_request', array( 'WPVibe_REST', 'application_password_is_api_request' ) );
+
+// File scope: SeedProd Pro reads this on plugins_loaded, ahead of wpvibe_init.
+add_filter( 'seedprod_allow_theme_display', array( 'WPVibe_Preview', 'allow_seedprod_theme' ) );
 
 /**
  * Register the "WPVibe" custom theme header on every request — wp_get_theme()->get( 'WPVibe' )

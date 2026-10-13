@@ -2,7 +2,7 @@
 /**
  * WPCode snippet bridge.
  *
- * Creates/updates snippets through WPCode's own snippet class — WPCode is the
+ * Creates, updates, turns off and trashes snippets through WPCode's own snippet class — WPCode is the
  * execution engine; this plugin contains zero eval. Two invariants, server
  * enforced: (1) the snippet is written INACTIVE on create, and an update never
  * raises activation (a request `active` field is ignored entirely — it is
@@ -17,6 +17,7 @@
  * per-site cap, or an update to a snippet WPVibe created whose code nobody
  * changed since, that is disabled now, keeping its code type. Anything else is
  * refused with snippet_review_required and goes through the approval panel.
+ * Turning off a snippet WPVibe created is a dormant write; trashing one always needs approval.
  *
  * @package WPVibe
  */
@@ -56,11 +57,27 @@ class WPVibe_Code_Snippet {
 	const MARKER_META = '_wpvibe_snippet';
 	// Unix time of a dormant create, for the per-site cap.
 	const DORMANT_CREATED_META = '_wpvibe_dormant_created';
+	// Set when WPVibe turns off a snippet that was running (on, or still in WPCode's cache): its code ran, so a rewrite needs approval again.
+	const WAS_ENABLED_META = '_wpvibe_was_enabled';
 	// WPCode tag shown in its snippet list, so the human can see which snippets the AI wrote.
 	const MARKER_TAG = 'wpvibe';
 
 	const DORMANT_CREATE_CAP    = 10;
 	const DORMANT_CREATE_WINDOW = 1800;
+
+	// Ship in 1.20.4 or later: the Worker offers these only from RETIRE_SNIPPET_PLUGIN_VERSION.
+	const RETIRE_ACTIONS = array( 'deactivate', 'delete' );
+
+	/** What the per-op proof is signed over: the code for a write, the action and id for a retire. */
+	public static function proof_subject( $request ) {
+		$action = sanitize_key( (string) $request->get_param( 'action' ) );
+		if ( in_array( $action, self::RETIRE_ACTIONS, true ) ) {
+			return $action . ':' . absint( $request->get_param( 'id' ) );
+		}
+		$code = (string) $request->get_param( 'code' );
+		// A write whose code spells a retire subject could reuse that retire's proof; such a write never verifies.
+		return preg_match( '/^(?:deactivate|delete):[0-9]+$/D', $code ) ? "\0" . $code : $code;
+	}
 
 	public static function write_refusal_text() {
 		return __( 'WPCode snippets and their storage cannot be written through this route. Use the code_snippet tool instead: it routes the code through the approval panel, writes the snippet disabled, and leaves activation to the human in wp-admin.', 'vibe-ai' );
@@ -175,7 +192,7 @@ class WPVibe_Code_Snippet {
 	public static function dormant_refusal( $type, $existing = null ) {
 		if ( null === $existing ) {
 			$reason = self::recent_dormant_creates() >= self::DORMANT_CREATE_CAP ? 'create_cap' : null;
-		} elseif ( 'draft' !== $existing->post_status ) {
+		} elseif ( 'draft' !== $existing->post_status || '' !== (string) get_post_meta( (int) $existing->ID, self::WAS_ENABLED_META, true ) ) {
 			$reason = 'not_disabled';
 		} elseif ( ! self::wpvibe_owns_code( $existing ) ) {
 			$reason = 'not_wpvibe_code';
@@ -191,9 +208,10 @@ class WPVibe_Code_Snippet {
 		$why = array(
 			'create_cap'      => __( 'the per-site limit on snippets created without review in 30 minutes was reached', 'vibe-ai' ),
 			'busy'            => __( 'another snippet was being created on this site at the same moment', 'vibe-ai' ),
-			'not_disabled'    => __( 'the snippet is enabled (or not a plain disabled snippet)', 'vibe-ai' ),
+			'not_disabled'    => __( 'the snippet is enabled, or the user enabled it before WPVibe turned it off', 'vibe-ai' ),
 			'not_wpvibe_code' => __( 'the snippet was not written by WPVibe, or its code changed since WPVibe wrote it', 'vibe-ai' ),
 			'type_change'     => __( 'the edit changes the snippet\'s code type', 'vibe-ai' ),
+			'retire'          => __( 'it deletes a snippet', 'vibe-ai' ),
 		);
 		return new WP_Error(
 			'snippet_review_required',
@@ -201,6 +219,18 @@ class WPVibe_Code_Snippet {
 			sprintf( __( 'Nothing was written: this snippet write needs the user\'s approval because %s.', 'vibe-ai' ), $why[ $reason ] ),
 			WPVibe_Error_Contract::data( 'approval_flow', false, array( 'status' => 409, 'reason' => $reason ) )
 		);
+	}
+
+	// WPCode runs snippets from this option, whatever their post status.
+	private static function in_wpcode_cache( $id ) {
+		foreach ( (array) get_option( 'wpcode_snippets', array() ) as $snippets ) {
+			foreach ( (array) $snippets as $cached ) {
+				if ( (int) ( is_array( $cached ) ? ( $cached['id'] ?? 0 ) : 0 ) === (int) $id ) {
+					return true;
+				}
+			}
+		}
+		return false;
 	}
 
 	// WPCode requires this class only under is_admin(), but its always-loaded logger calls it statically on REST.
@@ -347,9 +377,9 @@ class WPVibe_Code_Snippet {
 
 	/**
 	 * POST /wpvibe/v1/code-snippet: called by the Worker only AFTER the user
-	 * approved the exact code + type + location in the browser panel.
-	 * POST /wpvibe/v1/code-snippet/dormant ($dormant): no approval; the write
-	 * must qualify under dormant_refusal() and always lands disabled.
+	 * approved the exact code + type + location (or, for a retire, the snippet) in the browser panel.
+	 * POST /wpvibe/v1/code-snippet/dormant ($dormant): no approval; a write
+	 * must qualify under dormant_refusal() and always lands disabled; a deactivate runs, a delete is refused.
 	 */
 	public static function handle( $request, $dormant = false ) {
 		if ( ! self::wpcode_available() ) {
@@ -363,7 +393,13 @@ class WPVibe_Code_Snippet {
 			);
 		}
 
-		$action   = 'update' === $request->get_param( 'action' ) ? 'update' : 'create';
+		$requested = sanitize_key( (string) $request->get_param( 'action' ) );
+		if ( in_array( $requested, self::RETIRE_ACTIONS, true ) ) {
+			// Turning off a WPVibe snippet loses nothing and the user can turn it back on, so it needs no approval; a delete does.
+			return $dormant && 'delete' === $requested ? self::review_error( 'retire' ) : self::retire( $requested, (int) $request->get_param( 'id' ) );
+		}
+
+		$action   = 'update' === $requested ? 'update' : 'create';
 		$existing = null;
 		if ( 'update' === $action ) {
 			$id_param = (int) $request->get_param( 'id' );
@@ -484,14 +520,24 @@ class WPVibe_Code_Snippet {
 		if ( $dormant && null === $existing ) {
 			update_post_meta( $id, self::DORMANT_CREATED_META, time() );
 		}
-		if ( $dormant && $active ) {
+		if ( ! $dormant ) {
+			delete_post_meta( $id, self::WAS_ENABLED_META );
+		}
+		$wpcode_active = $active;
+		// Re-read, so the reply is true when a human turned the snippet on during the save.
+		clean_post_cache( $id );
+		if ( 'publish' === get_post_status( $id ) ) {
+			$active = true;
+		}
+		// WPCode's own enabled result is reverted; an enable that lands after that read stands.
+		$outcome = '';
+		if ( $dormant && $wpcode_active ) {
 			// Unreachable while WPCode honours active=false; fail closed if a filter or version ever flips it.
 			wp_update_post( array( 'ID' => $id, 'post_status' => 'draft' ) );
-			return new WP_Error(
-				'wpcode_save_failed',
-				__( 'WPCode saved the snippet as enabled, so WPVibe turned it off again. Ask the user to review it in wp-admin.', 'vibe-ai' ),
-				WPVibe_Error_Contract::data( 'wp_core', false, array( 'status' => 500 ) )
-			);
+			// A bare status change leaves the code in WPCode's cache.
+			( new WPCode_Snippet( $id ) )->rebuild_cache();
+			clean_post_cache( $id );
+			$outcome = 'publish' === get_post_status( $id ) ? 'unreverted' : 'reverted';
 		}
 		$edit_url = method_exists( $saved, 'get_edit_url' )
 			? $saved->get_edit_url()
@@ -499,10 +545,19 @@ class WPVibe_Code_Snippet {
 
 		$was_active = null !== $existing && 'publish' === $existing->post_status;
 
+		if ( 'unreverted' === $outcome ) {
+			$summary = 'turned on during the save; WPVibe could not turn it off';
+		} elseif ( 'reverted' === $outcome ) {
+			$summary = 'turned on during the save; WPVibe turned it off again';
+		} elseif ( $dormant && $active ) {
+			$summary = 'saved; it was turned on in WordPress during the save';
+		} else {
+			$summary = $active ? 'updated (activation preserved: on)' : ( $was_active ? 'updated (deactivated pending human re-enable)' : 'saved inactive' );
+		}
 		if ( class_exists( 'WPVibe_Audit_Log' ) ) {
 			WPVibe_Audit_Log::log_execution( array(
 				'operation'      => 'code_snippet_' . $action . ':' . $id,
-				'command'        => sprintf( 'code_snippet %s #%d (%s @ %s)%s', $action, $id, $data['code_type'], $data['location'], $dormant ? ' without approval, saved disabled' : '' ),
+				'command'        => sprintf( 'code_snippet %s #%d (%s @ %s)%s', $action, $id, $data['code_type'], $data['location'], $dormant ? ' without approval' : '' ),
 				'params'         => array(
 					'title'         => $data['title'],
 					'code_type'     => $data['code_type'],
@@ -510,18 +565,32 @@ class WPVibe_Code_Snippet {
 					'insert_method' => $data['auto_insert'] ? 'auto' : 'shortcode',
 					'code_bytes'    => strlen( $data['code'] ),
 				),
-				'result_summary' => $active ? 'updated (activation preserved: on)' : ( $was_active ? 'updated (deactivated pending human re-enable)' : 'saved inactive' ),
+				'result_summary' => $summary,
 			) );
 		}
 
-		if ( $active ) {
+		if ( '' !== $outcome ) {
+			return new WP_Error(
+				'unreverted' === $outcome ? 'wpcode_enable_unreverted' : 'wpcode_enable_reverted',
+				'unreverted' === $outcome
+					/* translators: 1: snippet ID, 2: wp-admin URL */
+					? sprintf( __( 'Snippet #%1$d was saved and turned on during the save, and WPVibe could not turn it off again. It is running. Ask the user to turn it off and review it in wp-admin: %2$s', 'vibe-ai' ), $id, $edit_url )
+					/* translators: 1: snippet ID, 2: wp-admin URL */
+					: sprintf( __( 'Snippet #%1$d was saved and turned on during the save, so WPVibe turned it off again. It is not running. Ask the user to review it in wp-admin: %2$s', 'vibe-ai' ), $id, $edit_url ),
+				WPVibe_Error_Contract::data( 'wp_core', false, array( 'status' => 500, 'id' => $id, 'enable_url' => $edit_url ) )
+			);
+		}
+
+		if ( $dormant && $active ) {
+			$next_step = __( 'The snippet is saved, and it was turned on in WordPress during the save, so it is running. Tell the user.', 'vibe-ai' );
+		} elseif ( $active ) {
 			$next_step = __( 'The snippet was updated and stays enabled (the human enabled it previously).', 'vibe-ai' );
 		} elseif ( $was_active ) {
 			$next_step = __( 'This update turned the snippet OFF: edited server-executed code must pass WPCode\'s activation check under a fresh human enable. Give the user the enable_url so they can re-activate it in wp-admin.', 'vibe-ai' );
 		} else {
 			$next_step = __( 'The snippet is saved but OFF. Give the user the enable_url — they review and activate it in wp-admin (WPCode runs a fatal-error check when they do).', 'vibe-ai' );
 		}
-		if ( $dormant ) {
+		if ( $dormant && ! $active ) {
 			$next_step = __( 'The snippet is saved but OFF and nothing runs yet: it was written without an approval prompt because enabling it is the user\'s review. Give the user the enable_url and tell them to read the code and enable it in wp-admin themselves. You cannot enable it.', 'vibe-ai' );
 		}
 
@@ -534,6 +603,110 @@ class WPVibe_Code_Snippet {
 			'reviewed'    => ! $dormant,
 			'shortcode'   => $data['auto_insert'] ? null : sprintf( '[wpcode id="%d"]', $id ),
 			'next_step'   => $next_step,
+		) );
+	}
+
+	/** Off first, then trash for delete: WPCode keeps running a trashed snippet from its cache until the cache is rebuilt. */
+	private static function retire( $action, $id ) {
+		$post = $id > 0 ? get_post( $id ) : null;
+		if ( ! $post || ! self::is_code_post_type( $post->post_type ) ) {
+			return new WP_Error(
+				'not_found',
+				/* translators: %d: snippet ID */
+				sprintf( __( 'No WPCode snippet with id %d.', 'vibe-ai' ), $id ),
+				WPVibe_Error_Contract::data( 'not_found', false, array( 'status' => 404 ) )
+			);
+		}
+		$edit_url = admin_url( 'admin.php?page=wpcode-snippet-manager&snippet_id=' . $id );
+		// Turning off needs only WPVibe's marker; deleting also needs the code unchanged since WPVibe wrote it.
+		$owned = 'delete' === $action ? self::wpvibe_owns_code( $post ) : '' !== (string) get_post_meta( $id, self::MARKER_META, true );
+		if ( ! $owned ) {
+			return new WP_Error(
+				'snippet_not_wpvibe',
+				/* translators: 1: snippet ID, 2: wp-admin URL */
+				'delete' === $action && '' !== (string) get_post_meta( $id, self::MARKER_META, true )
+					/* translators: 1: snippet ID, 2: wp-admin URL */
+					? sprintf( __( 'Nothing was changed: snippet #%1$d was created by WPVibe, but its code changed since, so WPVibe does not delete it. WPVibe can still turn it off (action "deactivate"), and the user can delete it in WPCode: %2$s', 'vibe-ai' ), $id, $edit_url )
+					/* translators: 1: snippet ID, 2: wp-admin URL */
+					: sprintf( __( 'Nothing was changed: WPVibe only turns off or deletes snippets it created, and snippet #%1$d was not created by WPVibe. The user can turn it off or delete it in WPCode: %2$s', 'vibe-ai' ), $id, $edit_url ),
+				WPVibe_Error_Contract::data( 'security_gate', false, array( 'status' => 403 ) )
+			);
+		}
+
+		$snippet    = new WPCode_Snippet( $id );
+		// A snippet that left publish without a cache rebuild still runs from WPCode's cache; the rebuild below stops it.
+		$was_active = 'publish' === $post->post_status || self::in_wpcode_cache( $id );
+		if ( $was_active ) {
+			update_post_meta( $id, self::WAS_ENABLED_META, time() );
+		}
+		if ( 'publish' === $post->post_status ) {
+			$snippet->deactivate();
+			clean_post_cache( $id );
+			if ( 'publish' === get_post_status( $id ) ) {
+				return new WP_Error(
+					'wpcode_save_failed',
+					/* translators: %s: wp-admin URL */
+					sprintf( __( 'WPCode did not turn the snippet off (the connected account may lack WPCode\'s permission to change snippet status). It is still running. The user can turn it off in WPCode: %s', 'vibe-ai' ), $edit_url ),
+					WPVibe_Error_Contract::data( 'wp_core', false, array( 'status' => 500 ) )
+				);
+			}
+		}
+		if ( 'delete' === $action && 'trash' !== get_post_status( $id ) ) {
+			// The same status change WPCode's own trash action makes, so its trash view can restore it.
+			wp_update_post( array( 'ID' => $id, 'post_status' => 'trash' ) );
+			clean_post_cache( $id );
+			if ( function_exists( 'wpcode' ) && isset( wpcode()->error ) && method_exists( wpcode()->error, 'clear_snippets_errors' ) ) {
+				wpcode()->error->clear_snippets_errors();
+			}
+		}
+		// A snippet trashed while active is still in the cache; rebuilding drops anything not published.
+		$cache_rebuilt = method_exists( $snippet, 'rebuild_cache' );
+		if ( $cache_rebuilt ) {
+			$snippet->rebuild_cache();
+		}
+		$status = (string) get_post_status( $id );
+		$trashed = 'delete' !== $action || 'trash' === $status;
+		if ( class_exists( 'WPVibe_Audit_Log' ) ) {
+			$off = ! $was_active ? 'already off' : ( 'publish' === $post->post_status || $cache_rebuilt ? 'turned off' : 'off in WordPress, WPCode cache not rebuilt' );
+			WPVibe_Audit_Log::log_execution( array(
+				'operation'      => 'code_snippet_' . $action . ':' . $id,
+				'command'        => sprintf( 'code_snippet %s #%d', $action, $id ),
+				'params'         => array( 'title' => $post->post_title ),
+				'result_summary' => 'delete' === $action ? ( $trashed ? $off . ', moved to the trash' : $off . ', not moved to the trash' ) : $off,
+			) );
+		}
+		if ( ! $trashed ) {
+			return new WP_Error(
+				'wpcode_save_failed',
+				/* translators: %s: wp-admin URL */
+				sprintf( __( 'The snippet is off, but WordPress did not move it to the trash. The user can delete it in WPCode: %s', 'vibe-ai' ), $edit_url ),
+				WPVibe_Error_Contract::data( 'wp_core', false, array( 'status' => 500 ) )
+			);
+		}
+
+		// Page caches can still hold the snippet's output.
+		$page_caches = array();
+		if ( class_exists( 'WPVibe_CLI' ) ) {
+			try {
+				$purge       = ( new WPVibe_CLI() )->purge_all_caches();
+				$purge_data  = isset( $purge['stdout'] ) ? json_decode( (string) $purge['stdout'], true ) : null;
+				$page_caches = isset( $purge_data['purged'] ) && is_array( $purge_data['purged'] ) ? array_values( $purge_data['purged'] ) : array();
+			} catch ( \Throwable $e ) { // phpcs:ignore Generic.CodeAnalysis.EmptyStatement.DetectedCatch -- a cache-engine failure must not hide that the snippet is off.
+			}
+		}
+
+		return rest_ensure_response( array(
+			'id'            => $id,
+			'action'        => $action,
+			'active'        => false,
+			'status'        => $status,
+			'title'         => $post->post_title,
+			'was_active'    => $was_active,
+			'cache_rebuilt' => $cache_rebuilt,
+			'page_caches'   => $page_caches,
+			'next_step'     => 'delete' === $action
+				? __( 'The snippet is off and in the trash in WPCode > Code Snippets, where the user can restore it or delete it for good.', 'vibe-ai' )
+				: __( 'The snippet is off and nothing from it runs. Only the user can turn it back on, in WPCode.', 'vibe-ai' ),
 		) );
 	}
 }

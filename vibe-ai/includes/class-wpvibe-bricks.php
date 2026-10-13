@@ -52,6 +52,7 @@ class WPVibe_Bricks {
 				'post_type' => array( 'type' => 'string',  'default'  => 'page', 'sanitize_callback' => 'sanitize_key' ),
 				'status'    => array( 'type' => 'string',  'default'  => 'publish', 'enum' => array( 'publish', 'draft', 'pending', 'private' ) ),
 				'elements'  => array( 'type' => 'array',   'required' => true ),
+				'template_type' => array( 'type' => 'string', 'required' => false, 'sanitize_callback' => 'sanitize_key' ),
 			),
 		) );
 
@@ -87,6 +88,7 @@ class WPVibe_Bricks {
 			'post_type' => $request->get_param( 'post_type' ),
 			'status'    => $request->get_param( 'status' ),
 			'elements'  => $request->get_param( 'elements' ),
+			'template_type' => $request->get_param( 'template_type' ),
 		) );
 		return is_wp_error( $result ) ? $result : rest_ensure_response( $result );
 	}
@@ -94,7 +96,7 @@ class WPVibe_Bricks {
 	/**
 	 * REST-independent save core (unit-testable).
 	 *
-	 * @param array $args id|title|post_type|status|elements.
+	 * @param array $args id|title|post_type|status|elements|template_type.
 	 * @return array|WP_Error { id, url, edit_url, warnings } on success.
 	 */
 	public function do_save( array $args ) {
@@ -106,11 +108,15 @@ class WPVibe_Bricks {
 		$post_type = $args['post_type'] ?? 'page';
 		$status    = $args['status'] ?? 'publish';
 		$id        = absint( $args['id'] ?? 0 );
+		$existing  = $id ? get_post( $id ) : null;
+		if ( $existing && ! empty( $existing->post_type ) ) {
+			$post_type = $existing->post_type;
+		}
 		$title     = $args['title'] ?? '';
 		$elements  = $args['elements'] ?? null;
 		$warnings  = array();
 
-		$code_post = WPVibe_Code_Snippet::code_post_write_error( $post_type, $id );
+		$code_post = WPVibe_Code_Snippet::code_post_write_error( $args['post_type'] ?? 'page', $id );
 		if ( $code_post ) {
 			return $code_post;
 		}
@@ -122,6 +128,28 @@ class WPVibe_Bricks {
 		$valid = $this->validate_elements( $elements, $warnings );
 		if ( is_wp_error( $valid ) ) {
 			return $valid;
+		}
+
+		$action = $id ? 'update' : 'create';
+		$caps   = $this->check_post_caps( $post_type, $action, $id, $status );
+		if ( is_wp_error( $caps ) ) {
+			return $caps;
+		}
+
+		if ( $id && ! $existing ) {
+			return new WP_Error( 'not_found', sprintf(
+				/* translators: %d: post ID */
+				__( 'Post #%d does not exist.', 'vibe-ai' ),
+				$id
+			), WPVibe_Error_Contract::data( 'invalid_input', false, array( 'status' => 404 ) ) );
+		}
+		if ( $existing && $this->template_slug() === ( $args['post_type'] ?? '' ) && $this->template_slug() !== $post_type ) {
+			return $this->invalid( sprintf( 'Post #%d is a "%s", not a bricks_template.', $id, $post_type ) );
+		}
+
+		$template_type = $this->resolve_template_type( $post_type, $existing, (string) ( $args['template_type'] ?? '' ) );
+		if ( is_wp_error( $template_type ) ) {
+			return $template_type;
 		}
 
 		// A CLI/automated theme activation never fires after_switch_theme, so
@@ -137,7 +165,7 @@ class WPVibe_Bricks {
 			if ( false === get_option( $option_key ) && is_callable( array( '\Bricks\Admin', 'set_default_settings' ) ) ) {
 				\Bricks\Admin::set_default_settings();
 				$warnings[] = __( 'Bricks default settings were missing (theme was activated without a wp-admin visit), which disables the builder and CSS enqueueing for every post type. Initialized them with Bricks\' own defaults.', 'vibe-ai' );
-			} else {
+			} elseif ( '' === $template_type ) {
 				$warnings[] = __( 'Bricks has no supported post types configured, so "Edit with Bricks" is unavailable and (in external-file CSS mode) per-post CSS will not be enqueued. Enable post types under Bricks → Settings → Post Types.', 'vibe-ai' );
 			}
 		}
@@ -145,27 +173,13 @@ class WPVibe_Bricks {
 		// Bricks only offers the builder for enabled post types (default: page
 		// only). Content still renders, but the user couldn't open it in Bricks.
 		$enabled = $this->bricks_setting( 'postTypes', array( 'page' ) );
-		if ( is_array( $enabled ) && ! in_array( $post_type, $enabled, true ) ) {
+		if ( '' === $template_type && is_array( $enabled ) && ! in_array( $post_type, $enabled, true ) ) {
 			$warnings[] = sprintf(
 				/* translators: 1: post type slug 2: comma-separated enabled types */
 				__( 'Bricks is not enabled for the "%1$s" post type (enabled: %2$s), so the page will render but "Edit with Bricks" will not appear for it. Enable the type under Bricks → Settings → Post Types if the user wants to edit it visually.', 'vibe-ai' ),
 				$post_type,
 				implode( ', ', $enabled )
 			);
-		}
-
-		$action = $id ? 'update' : 'create';
-		$caps   = $this->check_post_caps( $post_type, $action, $id, $status );
-		if ( is_wp_error( $caps ) ) {
-			return $caps;
-		}
-
-		if ( $id && ! get_post( $id ) ) {
-			return new WP_Error( 'not_found', sprintf(
-				/* translators: %d: post ID */
-				__( 'Post #%d does not exist.', 'vibe-ai' ),
-				$id
-			), WPVibe_Error_Contract::data( 'invalid_input', false, array( 'status' => 404 ) ) );
 		}
 
 		$created_id = 0;
@@ -192,17 +206,21 @@ class WPVibe_Bricks {
 			return new WP_Error( 'bricks_no_builder_access', __( 'The connected account does not have Bricks builder access for this post, so Bricks blocks the layout write. Connect as an administrator or grant the role builder access in Bricks → Settings → Builder Access.', 'vibe-ai' ), WPVibe_Error_Contract::data( 'capability_role', false, array( 'status' => 403 ) ) );
 		}
 
-		$result = $this->write_layout( $id, $elements, $status, $title, $created_id, $warnings );
+		$result = $this->write_layout( $id, $elements, $status, $title, $created_id, $warnings, $template_type );
 		if ( is_wp_error( $result ) ) {
 			return $result;
 		}
 
-		return array(
+		$out = array(
 			'id'       => $id,
 			'url'      => get_permalink( $id ),
 			'edit_url' => $this->builder_edit_url( $id ),
 			'warnings' => $warnings,
 		);
+		if ( '' !== $template_type ) {
+			$out['template_type'] = $template_type;
+		}
+		return $out;
 	}
 
 	/**
@@ -210,7 +228,8 @@ class WPVibe_Bricks {
 	 * then editor mode, then wp_update_post — Bricks' save_post CSS hook
 	 * bails while editor mode is still `wordpress`.
 	 */
-	private function write_layout( $id, array $elements, $status, $title, $created_id, array &$warnings ) {
+	private function write_layout( $id, array $elements, $status, $title, $created_id, array &$warnings, $template_type = '' ) {
+		$area = $this->template_area( $template_type );
 		// Bricks registers element controls (the settings -> CSS maps) on the
 		// 'wp' hook, which never fires in REST. Load them BEFORE any write:
 		// wp_update_post below fires Bricks' own save_post CSS generation, and
@@ -225,7 +244,7 @@ class WPVibe_Bricks {
 		$slashed = wp_slash( $elements );
 
 		if ( is_callable( array( '\Bricks\Helpers', 'security_check_elements_before_save' ) ) ) {
-			$checked = \Bricks\Helpers::security_check_elements_before_save( $slashed, $id, 'content' );
+			$checked = \Bricks\Helpers::security_check_elements_before_save( $slashed, $id, $area );
 			// Restricted users get the OLD elements back on a count mismatch —
 			// [] on a new page. Writing that would silently produce an empty
 			// page (and flip editor mode off), so fail loudly instead.
@@ -241,12 +260,13 @@ class WPVibe_Bricks {
 			$slashed = $checked;
 		}
 
-		update_post_meta( $id, $this->db_key( 'BRICKS_DB_PAGE_CONTENT', '_bricks_page_content_2' ), $slashed );
+		$data_key = $this->data_key( $area );
+		update_post_meta( $id, $data_key, $slashed );
 
 		// Verify the write landed (the metadata filter can still no-op it)
 		// BEFORE flipping editor mode — Bricks' own recompute would write
 		// `wordpress` here and silently disable rendering.
-		$stored = get_post_meta( $id, $this->db_key( 'BRICKS_DB_PAGE_CONTENT', '_bricks_page_content_2' ), true );
+		$stored = get_post_meta( $id, $data_key, true );
 		if ( empty( $stored ) || ! is_array( $stored ) ) {
 			if ( $created_id > 0 ) {
 				wp_delete_post( $created_id, true );
@@ -254,6 +274,13 @@ class WPVibe_Bricks {
 			return new WP_Error( 'bricks_write_blocked', __( 'Bricks blocked the layout meta write (no data was stored). This usually means the connected account lacks builder access for the post type.', 'vibe-ai' ), WPVibe_Error_Contract::data( 'capability_role', false, array( 'status' => 403 ) ) );
 		}
 
+		if ( '' !== $template_type ) {
+			update_post_meta( $id, $this->template_type_key(), $template_type );
+		}
+		// An older plugin wrote header/footer layouts under the content key; Bricks never reads that copy.
+		if ( 'content' !== $area && get_post_meta( $id, $this->data_key( 'content' ), true ) ) {
+			delete_post_meta( $id, $this->data_key( 'content' ) );
+		}
 		update_post_meta( $id, $this->db_key( 'BRICKS_DB_EDITOR_MODE', '_bricks_editor_mode' ), 'bricks' );
 
 		$update = array( 'ID' => $id, 'post_status' => $status );
@@ -376,7 +403,14 @@ class WPVibe_Bricks {
 		// Direct meta read on purpose: Helpers::get_bricks_data() prefers an
 		// active TEMPLATE's elements, which would hand back the wrong layout
 		// for read-modify-write.
-		$elements = get_post_meta( $id, $this->db_key( 'BRICKS_DB_PAGE_CONTENT', '_bricks_page_content_2' ), true );
+		$template_type = $this->stored_template_type( $post );
+		$area          = $this->template_area( $template_type );
+		$elements      = get_post_meta( $id, $this->data_key( $area ), true );
+		$legacy        = false;
+		if ( 'content' !== $area && ( empty( $elements ) || ! is_array( $elements ) ) ) {
+			$elements = get_post_meta( $id, $this->data_key( 'content' ), true );
+			$legacy   = ! empty( $elements ) && is_array( $elements );
+		}
 		if ( empty( $elements ) || ! is_array( $elements ) ) {
 			return new WP_Error( 'bricks_no_content', sprintf(
 				/* translators: %d: post ID */
@@ -385,14 +419,25 @@ class WPVibe_Bricks {
 			), WPVibe_Error_Contract::data( 'invalid_input', false, array( 'status' => 404 ) ) );
 		}
 
-		return rest_ensure_response( array(
+		$out = array(
 			'id'          => $id,
 			'title'       => get_the_title( $post ),
 			'status'      => $post->post_status ?? '',
 			'editor_mode' => get_post_meta( $id, $this->db_key( 'BRICKS_DB_EDITOR_MODE', '_bricks_editor_mode' ), true ),
 			'elements'    => array_values( $elements ),
 			'edit_url'    => $this->builder_edit_url( $id ),
-		) );
+		);
+		if ( '' !== $template_type ) {
+			$out['template_type'] = $template_type;
+		}
+		if ( $legacy ) {
+			$out['warnings'] = array( sprintf(
+				/* translators: %s: template type (header or footer) */
+				__( 'This %s layout is stored under the content key by an older WPVibe plugin, so Bricks does not render it. Saving it back with save-page and this id moves it to the right key.', 'vibe-ai' ),
+				$template_type
+			) );
+		}
+		return rest_ensure_response( $out );
 	}
 
 	// ------------------------------------------------------------------
@@ -464,6 +509,51 @@ class WPVibe_Bricks {
 
 	private function invalid( $message ) {
 		return new WP_Error( 'invalid_input', $message, WPVibe_Error_Contract::data( 'invalid_input', false, array( 'status' => 400 ) ) );
+	}
+
+	private function resolve_template_type( $post_type, $existing, $requested ) {
+		$id = $existing ? (int) $existing->ID : 0;
+		if ( $this->template_slug() !== $post_type ) {
+			if ( '' !== $requested ) {
+				return $this->invalid( $id ? sprintf( 'Post #%d is a "%s", not a bricks_template, so `template_type` does not apply.', $id, $post_type ) : '`template_type` applies only to post_type "bricks_template".' );
+			}
+			return '';
+		}
+		$stored = $this->stored_template_type( $existing );
+		if ( '' !== $stored ) {
+			if ( '' !== $requested && $requested !== $stored ) {
+				return $this->invalid( sprintf( 'Template #%d is a "%s" template. Its type changes in Bricks > Templates, which moves the layout; save-page keeps the stored type.', $id, $stored ) );
+			}
+			return $stored;
+		}
+		$known = class_exists( '\Bricks\Setup' ) && is_array( \Bricks\Setup::$control_options['templateTypes'] ?? null ) ? array_keys( \Bricks\Setup::$control_options['templateTypes'] ) : array();
+		if ( '' !== $requested && $known && ! in_array( $requested, $known, true ) ) {
+			return $this->invalid( sprintf( 'Unknown Bricks template_type "%s". This site supports: %s.', $requested, implode( ', ', $known ) ) );
+		}
+		if ( '' === $requested ) {
+			return $this->invalid( 'A Bricks template needs `template_type` (for example "header", "footer", "content", "section" or "popup"). It decides where Bricks stores and renders the layout.' );
+		}
+		return $requested;
+	}
+
+	private function template_area( $template_type ) {
+		return in_array( $template_type, array( 'header', 'footer' ), true ) ? $template_type : 'content';
+	}
+
+	private function data_key( $area ) {
+		return \Bricks\Database::get_bricks_data_key( $area );
+	}
+
+	private function stored_template_type( $post ) {
+		return $post && $this->template_slug() === ( $post->post_type ?? '' ) ? (string) get_post_meta( $post->ID, $this->template_type_key(), true ) : '';
+	}
+
+	private function template_type_key() {
+		return $this->db_key( 'BRICKS_DB_TEMPLATE_TYPE', '_bricks_template_type' );
+	}
+
+	private function template_slug() {
+		return $this->db_key( 'BRICKS_DB_TEMPLATE_SLUG', 'bricks_template' );
 	}
 
 	private function db_key( $constant, $fallback ) {

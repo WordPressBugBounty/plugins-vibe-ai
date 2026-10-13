@@ -268,6 +268,15 @@ class WPVibe_Self_Update {
 			require_once ABSPATH . 'wp-admin/includes/admin.php';
 			require_once ABSPATH . 'wp-admin/includes/class-wp-upgrader.php';
 
+			// Plugin_Upgrader::upgrade() (which the automatic updater calls) silently
+			// deactivates the plugin unless wp_doing_cron(), and this runs in-request
+			// or by loopback, so WPVibe came back switched off on every site that
+			// updated this way (1118f6). The update below runs as core's background
+			// updates do instead; this state is only for the fallback after it.
+			$was_active  = is_plugin_active( WPVIBE_PLUGIN_BASENAME );
+			$was_network = is_multisite() && function_exists( 'is_plugin_active_for_network' )
+				&& is_plugin_active_for_network( WPVIBE_PLUGIN_BASENAME );
+
 			$result    = null;
 			$used_auto = false;
 			if ( class_exists( 'WP_Automatic_Updater' ) ) {
@@ -281,9 +290,23 @@ class WPVibe_Self_Update {
 						return is_object( $it ) && isset( $it->plugin ) && WPVIBE_PLUGIN_BASENAME === $it->plugin;
 					};
 					add_filter( 'auto_update_plugin', $only_self, PHP_INT_MAX, 2 );
+					// As a core background update: the plugin stays active, so core's
+					// post-update check loads the NEW code on a loopback to the home
+					// page and rolls back on a fatal. Outside cron core deactivates
+					// first, and that check then cannot see a WPVibe fatal at all.
+					add_filter( 'wp_doing_cron', '__return_true', PHP_INT_MAX );
+					// As WP_Automatic_Updater::run() does before calling update(): under
+					// cron these upgrader_process_complete hooks start a nested auto-update
+					// pass (wp_version_check -> wp_maybe_auto_update), which reinstalls
+					// WPVibe, emails the admin and defeats the crash rollback.
+					$quieted = $this->quiet_update_hooks();
 					try {
 						$result = $updater->update( 'plugin', $item );
 					} finally {
+						foreach ( $quieted as $hook ) {
+							add_action( 'upgrader_process_complete', $hook[0], $hook[1], $hook[2] );
+						}
+						remove_filter( 'wp_doing_cron', '__return_true', PHP_INT_MAX );
 						remove_filter( 'auto_update_plugin', $only_self, PHP_INT_MAX );
 					}
 				}
@@ -299,6 +322,7 @@ class WPVibe_Self_Update {
 			// old code, so WPVIBE_VERSION cannot tell whether files were swapped.
 			$disk         = get_plugin_data( WP_PLUGIN_DIR . '/vibe-ai/vibe-ai.php', false, false );
 			$disk_version = isset( $disk['Version'] ) ? (string) $disk['Version'] : '';
+			$reactivated  = $was_active && $this->reactivate( $was_network );
 			$active       = is_plugin_active( WPVIBE_PLUGIN_BASENAME );
 
 			if ( '' !== $disk_version && $disk_version !== $from ) {
@@ -308,6 +332,7 @@ class WPVibe_Self_Update {
 					'to_version'   => $disk_version,
 					'finished_at'  => time(),
 					'still_active' => (bool) $active,
+					'reactivated'  => $reactivated,
 				), false );
 				WPVibe_Change_Tracker::mark( array(
 					'summary'      => "WPVibe updated: {$from} -> {$disk_version}",
@@ -325,6 +350,45 @@ class WPVibe_Self_Update {
 		} catch ( \Throwable $e ) {
 			return $this->finish_failed( $from, $to, $e->getMessage(), false );
 		}
+	}
+
+	/**
+	 * Detach the upgrader_process_complete hooks core's run() detaches
+	 * (class-wp-automatic-updater.php run(), admin-filters.php 146-149).
+	 * Returns what was attached, as [callback, priority, accepted_args], to restore.
+	 */
+	private function quiet_update_hooks() {
+		$hooks   = array(
+			array( array( 'Language_Pack_Upgrader', 'async_upgrade' ), 1 ),
+			array( 'wp_version_check', 0 ),
+			array( 'wp_update_plugins', 0 ),
+			array( 'wp_update_themes', 0 ),
+		);
+		$removed = array();
+		foreach ( $hooks as $hook ) {
+			$priority = has_action( 'upgrader_process_complete', $hook[0] );
+			if ( false !== $priority ) {
+				remove_action( 'upgrader_process_complete', $hook[0], $priority );
+				$removed[] = array( $hook[0], $priority, $hook[1] );
+			}
+		}
+		return $removed;
+	}
+
+	/**
+	 * Fallback only: the automatic updater runs as cron and never deactivates,
+	 * and bulk_upgrade() does not either, so this should find WPVibe active. If
+	 * something still dropped it, switch it back on silently (only the
+	 * active_plugins option, no activation hooks). Nothing here test-loads the
+	 * new code: include_once skips the already-loaded main file.
+	 * True when it had to switch the plugin back on.
+	 */
+	private function reactivate( $network_wide ) {
+		if ( is_plugin_active( WPVIBE_PLUGIN_BASENAME ) ) {
+			return false;
+		}
+		$res = activate_plugin( WPVIBE_PLUGIN_BASENAME, '', (bool) $network_wide, true );
+		return ! is_wp_error( $res ) && is_plugin_active( WPVIBE_PLUGIN_BASENAME );
 	}
 
 	private function finish_failed( $from, $to, $error, $rolled_back ) {

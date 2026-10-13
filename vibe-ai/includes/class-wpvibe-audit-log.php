@@ -82,14 +82,15 @@ class WPVibe_Audit_Log {
 	 */
 	public static function log_execution( $args ) {
 		global $wpdb;
-		$table = self::table_name();
+		$table    = self::table_name();
+		$bypassed = class_exists( 'WPVibe_Approval_Bypass' ) && WPVibe_Approval_Bypass::$request_bypassed;
 		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
 		$inserted = $wpdb->insert(
 			$table,
 			array(
 				'user_id'        => get_current_user_id(),
 				'operation'      => substr( (string) ( $args['operation'] ?? 'unknown' ), 0, 64 ),
-				'command'        => (string) ( $args['command'] ?? '' ) . ( class_exists( 'WPVibe_Approval_Bypass' ) && WPVibe_Approval_Bypass::$request_bypassed ? ' [no approval: bypass on]' : '' ),
+				'command'        => (string) ( $args['command'] ?? '' ) . ( $bypassed ? ' [no approval: bypass on]' : '' ),
 				'params_json'    => isset( $args['params'] ) ? wp_json_encode( $args['params'] ) : null,
 				'dry_run_json'   => isset( $args['dry_run'] ) ? wp_json_encode( $args['dry_run'] ) : null,
 				// Cut by character, not byte: a cut inside a multibyte character is invalid UTF-8, which wpdb refuses to insert,
@@ -99,11 +100,46 @@ class WPVibe_Audit_Log {
 			array( '%d', '%s', '%s', '%s', '%s', '%s' )
 		);
 
-		if ( false === $inserted ) {
-			return false;
+		$logged = false !== $inserted;
+		if ( $logged ) {
+			self::trim_to_max_rows();
 		}
-		self::trim_to_max_rows();
-		return true;
+		self::announce( $args, $bypassed, $logged );
+		return $logged;
+	}
+
+	/**
+	 * Tell other plugins (security logs, activity monitors) that WPVibe ran an
+	 * operation (#880). Fires even when the row failed to save, so a listener
+	 * still sees it. A listener that throws never fails the operation.
+	 *
+	 * @param array $args     as passed to log_execution().
+	 * @param bool  $bypassed approvals were skipped for this request (bypass on).
+	 * @param bool  $logged   the row reached WPVibe's own audit log.
+	 */
+	private static function announce( $args, $bypassed, $logged ) {
+		$entry = array(
+			'operation'         => (string) ( $args['operation'] ?? 'unknown' ),
+			'command'           => (string) ( $args['command'] ?? '' ),
+			'params'            => $args['params'] ?? null,
+			'dry_run'           => $args['dry_run'] ?? null,
+			'result_summary'    => isset( $args['result_summary'] ) ? (string) $args['result_summary'] : null,
+			'user_id'           => get_current_user_id(),
+			'approval_bypassed' => $bypassed,
+		);
+		try {
+			/**
+			 * Fires after WPVibe runs a destructive operation (post-approval, or with approvals bypassed).
+			 *
+			 * @param array $entry  operation, command, params, dry_run (the preview the user approved),
+			 *                      result_summary, user_id, approval_bypassed.
+			 * @param bool  $logged whether the row was saved to WPVibe's audit log.
+			 */
+			do_action( 'wpvibe_operation_executed', $entry, $logged );
+		} catch ( Throwable $e ) {
+			// A third-party listener's error is not the operation's error.
+			unset( $e );
+		}
 	}
 
 	/**

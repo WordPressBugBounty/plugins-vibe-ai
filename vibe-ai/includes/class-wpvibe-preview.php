@@ -69,7 +69,49 @@ class WPVibe_Preview {
 				: ( isset( $_COOKIE[ self::COOKIE_NAME ] ) ? sanitize_text_field( wp_unslash( $_COOKIE[ self::COOKIE_NAME ] ) ) : '' );
 			add_action( 'wp_enqueue_scripts', array( $this, 'enqueue_preview_assets' ) );
 			add_action( 'wp_footer', array( $this, 'render_preview_banner' ), 9999 );
+			// Host CDNs cached preview pages, token URL included, for 31 days.
+			if ( ! defined( 'DONOTCACHEPAGE' ) ) {
+				define( 'DONOTCACHEPAGE', true );
+			}
+			add_action( 'send_headers', array( $this, 'send_nocache_headers' ) );
 		}
+	}
+
+	/**
+	 * SeedProd's Website Builder hides the theme on plugins_loaded, before
+	 * wpvibe_init runs, unless this filter says the theme may display.
+	 *
+	 * @param bool $allow Whether SeedProd lets the theme render.
+	 * @return bool
+	 */
+	public static function allow_seedprod_theme( $allow ) {
+		return self::instance()->get_preview_slug() ? true : $allow;
+	}
+
+	/**
+	 * The preview lifts SeedProd's theme override, but publish does not turn it off,
+	 * so a site with SeedProd's Website Builder on keeps showing SeedProd pages after publish.
+	 *
+	 * @param bool $published True for the publish reply, false for the preview.
+	 * @return string Empty when SeedProd's Website Builder is off.
+	 */
+	public static function seedprod_theme_note( $published = false ) {
+		if ( ! defined( 'SEEDPROD_PRO_VERSION' ) || empty( get_option( 'seedprod_theme_enabled' ) ) ) {
+			return '';
+		}
+		$who = get_option( 'seedprod_theme_template_preview_mode' )
+			? __( 'logged-in users', 'vibe-ai' )
+			: __( 'visitors', 'vibe-ai' );
+		return $published
+			/* translators: %s: who sees the SeedProd site ("visitors" or "logged-in users") */
+			? sprintf( __( 'SeedProd\'s Website Builder is on, so %s still see the SeedProd site, not this theme, until the user turns off "Enable SeedProd Theme" in SeedProd > Website Builder.', 'vibe-ai' ), $who )
+			/* translators: %s: who sees the SeedProd site ("visitors" or "logged-in users") */
+			: sprintf( __( 'SeedProd\'s Website Builder is on. This preview shows the draft theme only because WPVibe lifts SeedProd\'s theme for the preview; after publish, %s keep seeing the SeedProd site until the user turns off "Enable SeedProd Theme" in SeedProd > Website Builder.', 'vibe-ai' ), $who );
+	}
+
+	public function send_nocache_headers() {
+		nocache_headers();
+		header( 'X-Robots-Tag: noindex, nofollow' );
 	}
 
 	/**
@@ -417,6 +459,12 @@ class WPVibe_Preview {
 			</span>
 			<span class="wpvibe-info">
 				<?php esc_html_e( 'Changes are only visible to you. The live site is unaffected.', 'vibe-ai' ); ?>
+				<?php
+				$seedprod_note = self::seedprod_theme_note();
+				if ( '' !== $seedprod_note ) {
+					echo ' ' . esc_html( $seedprod_note );
+				}
+				?>
 			</span>
 			<a href="<?php echo esc_url( $stop_url ); ?>" class="wpvibe-btn wpvibe-btn-stop" data-wpvibe-no-preview><?php esc_html_e( 'End Preview', 'vibe-ai' ); ?></a>
 			<a href="<?php echo esc_url( $live_url ); ?>" class="wpvibe-btn wpvibe-btn-live" data-wpvibe-no-preview><?php esc_html_e( 'View Live Site', 'vibe-ai' ); ?></a>

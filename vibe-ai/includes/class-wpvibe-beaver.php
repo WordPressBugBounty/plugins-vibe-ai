@@ -25,6 +25,8 @@ class WPVibe_Beaver {
 
 	private static $instance = null;
 
+	private $created_id = 0;
+
 	public static function instance() {
 		if ( null === self::$instance ) {
 			self::$instance = new self();
@@ -67,7 +69,7 @@ class WPVibe_Beaver {
 			'callback'            => array( $this, 'get_schema' ),
 			'permission_callback' => array( $this, 'can_edit_posts' ),
 			'args'                => array(
-				'slug' => array( 'type' => 'string', 'required' => true, 'sanitize_callback' => 'sanitize_key' ),
+				'slug' => array( 'type' => 'string', 'required' => false, 'sanitize_callback' => 'sanitize_key' ),
 			),
 		) );
 	}
@@ -81,6 +83,37 @@ class WPVibe_Beaver {
 	// ------------------------------------------------------------------
 
 	public function save_page( WP_REST_Request $request ) {
+		add_filter( 'wp_php_error_message', array( $this, 'fatal_detail' ), 10, 2 );
+		$this->created_id = 0;
+		try {
+			return $this->do_save_page( $request );
+		} catch ( \Throwable $e ) {
+			if ( $this->created_id > 0 ) {
+				wp_delete_post( $this->created_id, true );
+			}
+			return new WP_Error( 'beaver_save_fatal', sprintf(
+				/* translators: %s: error detail or a generic note */
+				__( 'The save stopped with a PHP error: %s', 'vibe-ai' ),
+				$this->error_detail( $e )
+			), WPVibe_Error_Contract::data( 'invalid_input', false, array( 'status' => 400 ) ) );
+		} finally {
+			remove_filter( 'wp_php_error_message', array( $this, 'fatal_detail' ), 10 );
+		}
+	}
+
+	private function error_detail( \Throwable $e ) {
+		return current_user_can( 'manage_options' ) ? WPVibe_Draft_Theme::site_relative( $e->getMessage() . ' in ' . $e->getFile() . ':' . $e->getLine() ) : __( 'details are shown to administrators only', 'vibe-ai' );
+	}
+
+	// An uncatchable fatal (memory, time limit) during a save: administrators get the cause in the REST error body.
+	public function fatal_detail( $message, $error ) {
+		if ( ! is_array( $error ) || ! current_user_can( 'manage_options' ) ) {
+			return $message;
+		}
+		return $message . ' ' . esc_html( WPVibe_Draft_Theme::site_relative( sprintf( 'Beaver save fatal: %s in %s:%d', $error['message'] ?? '', $error['file'] ?? '', (int) ( $error['line'] ?? 0 ) ) ) );
+	}
+
+	private function do_save_page( WP_REST_Request $request ) {
 		$check = $this->fl_builder_check();
 		if ( is_wp_error( $check ) ) {
 			return $check;
@@ -122,7 +155,7 @@ class WPVibe_Beaver {
 		// would introduce unsafe HTML is rejected rather than sanitized silently,
 		// because the html module renders its `html` setting with a raw echo.
 		// (The code-field strip runs below, on the decoded object tree.)
-		$restricted = ! FLBuilderModel::user_has_unfiltered_html();
+		$restricted = ! $this->user_has_unfiltered_html();
 		if ( $restricted ) {
 			$unsafe = $this->find_unsafe_node( $data );
 			if ( null !== $unsafe ) {
@@ -177,7 +210,8 @@ class WPVibe_Beaver {
 			if ( is_wp_error( $id ) ) {
 				return $id;
 			}
-			$created_id = $id;
+			$created_id       = $id;
+			$this->created_id = $id;
 		} elseif ( $request->get_param( 'title' ) ) {
 			wp_update_post( WPVibe_Content_Ops::keep_page_template( array( 'ID' => $id, 'post_title' => $request->get_param( 'title' ) ) ) );
 		}
@@ -214,12 +248,13 @@ class WPVibe_Beaver {
 		} catch ( \Throwable $e ) {
 			FLBuilderModel::reset_post_id();
 			if ( $created_id > 0 ) {
+				$this->created_id = 0;
 				wp_delete_post( $created_id, true );
 			}
 			return new WP_Error( 'beaver_save_fatal', sprintf(
 				/* translators: 1: exception message 2: cleanup note */
 				__( 'Beaver Builder threw during save: %1$s. %2$s', 'vibe-ai' ),
-				$e->getMessage(),
+				$this->error_detail( $e ),
 				$created_id > 0 ? __( 'The partially created page was deleted; fix the data and retry.', 'vibe-ai' ) : __( 'The existing page kept its previous saved data.', 'vibe-ai' )
 			), WPVibe_Error_Contract::data( 'invalid_input', false, array( 'status' => 400 ) ) );
 		}
@@ -394,8 +429,18 @@ class WPVibe_Beaver {
 		if ( is_wp_error( $check ) ) {
 			return $check;
 		}
+		$slug = (string) $request->get_param( 'slug' );
+		if ( '' === $slug ) {
+			return $this->list_modules();
+		}
+		if ( in_array( $slug, array( 'row', 'column-group', 'column' ), true ) ) {
+			return rest_ensure_response( array(
+				'slug'        => $slug,
+				'layout_node' => true,
+				'note'        => __( 'This is a layout node, not a module: its settings are optional and {} is valid. A column sets its width with settings.size (a percentage). Module slugs come from GET /wpvibe/v1/beaver/modules.', 'vibe-ai' ),
+			) );
+		}
 		FLBuilderModel::load_modules();
-		$slug = $request->get_param( 'slug' );
 		if ( ! isset( FLBuilderModel::$modules[ $slug ] ) ) {
 			return new WP_Error( 'unknown_module', sprintf(
 				/* translators: %s: module slug */
@@ -450,6 +495,11 @@ class WPVibe_Beaver {
 			), WPVibe_Error_Contract::data( 'capability_role', false, array( 'status' => 403 ) ) );
 		}
 		return true;
+	}
+
+	// FLBuilderModel::user_has_unfiltered_html() exists only from Beaver 2.6; older Beaver checks nothing, so use the capability.
+	private function user_has_unfiltered_html() {
+		return is_callable( array( 'FLBuilderModel', 'user_has_unfiltered_html' ) ) ? FLBuilderModel::user_has_unfiltered_html() : current_user_can( 'unfiltered_html' );
 	}
 
 	private function fl_builder_check() {

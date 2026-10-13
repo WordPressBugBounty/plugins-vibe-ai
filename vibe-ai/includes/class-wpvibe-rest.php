@@ -657,23 +657,24 @@ class WPVibe_REST {
 				'required'          => false,
 				'sanitize_callback' => 'absint',
 			),
+			// Required for create and update only; snippet_data() refuses a missing one.
 			'code' => array(
 				'type'     => 'string',
-				'required' => true,
+				'required' => false,
 			),
 			'title' => array(
 				'type'              => 'string',
-				'required'          => true,
+				'required'          => false,
 				'sanitize_callback' => 'sanitize_text_field',
 			),
 			'code_type' => array(
 				'type'              => 'string',
-				'required'          => true,
+				'required'          => false,
 				'sanitize_callback' => 'sanitize_key',
 			),
 			'location' => array(
 				'type'              => 'string',
-				'required'          => true,
+				'required'          => false,
 				'sanitize_callback' => 'sanitize_key',
 			),
 			'insert_method' => array(
@@ -704,10 +705,12 @@ class WPVibe_REST {
 
 		// --- SeedProd builder login (compile automation) ---
 
+		// Hidden from the index: agents otherwise call it on sites without SeedProd.
 		register_rest_route( $namespace, '/builder-login', array(
 			'methods'             => 'POST',
 			'callback'            => array( WPVibe_Builder_Login::instance(), 'mint' ),
 			'permission_callback' => array( $this, 'can_builder_login' ),
+			'show_in_index'       => false,
 			'args'                => array(
 				'page_id' => array(
 					'type'              => 'integer',
@@ -1138,7 +1141,7 @@ class WPVibe_REST {
 		if ( true !== $ok ) {
 			return $ok;
 		}
-		return WPVibe_Op_Proof::verify( $request, '/wpvibe/v1/code-snippet', (string) $request->get_param( 'code' ) );
+		return WPVibe_Op_Proof::verify( $request, '/wpvibe/v1/code-snippet', WPVibe_Code_Snippet::proof_subject( $request ) );
 	}
 
 	/** No approval, but still only the Worker: the proof is signed for this route alone. */
@@ -1147,7 +1150,7 @@ class WPVibe_REST {
 		if ( true !== $ok ) {
 			return $ok;
 		}
-		return WPVibe_Op_Proof::verify( $request, '/wpvibe/v1/code-snippet/dormant', (string) $request->get_param( 'code' ) );
+		return WPVibe_Op_Proof::verify( $request, '/wpvibe/v1/code-snippet/dormant', WPVibe_Code_Snippet::proof_subject( $request ) );
 	}
 
 	public function can_check_op_proof( $request ) {
