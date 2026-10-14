@@ -1,14 +1,14 @@
-=== WPVibe – MCP Server for WordPress, works with Claude, ChatGPT & other AI agents ===
+=== WPVibe – MCP Server for WordPress, works with Claude, ChatGPT & other AI MCP agents ===
 Contributors: seedprod, smub
 Tags: mcp, claude, chatgpt, ai-assistant, mcp-server
 Requires at least: 6.0
 Tested up to: 7.1
 Requires PHP: 7.4
-Stable tag: 1.20.4
+Stable tag: 1.20.5
 License: GPL-2.0-or-later
 License URI: https://www.gnu.org/licenses/gpl-2.0.html
 
-Let Claude, ChatGPT, Cursor and other MCP-compatible AI agents manage your content, themes and settings, with approvals for risky changes.
+MCP server for WordPress. Connect Claude, ChatGPT, Cursor or any MCP client to manage content, themes and settings, with approvals.
 
 == Description ==
 
@@ -218,6 +218,17 @@ No. WPVibe lets you manage your WordPress site entirely through conversation wit
 
 == Changelog ==
 
+= 1.20.5 =
+* Security: User meta changes that need your approval can no longer be slipped past it with a key the database treats as the same as a protected one (for example a different letter case, an accent or a hidden character). Keys like that are refused, and a write is refused whenever WPVibe cannot confirm which stored key it would touch. Thanks to the user who reported it.
+* Improvement: WPVibe's own updates are safer. An update waits while WordPress is running its own background updates, a failed or rolled-back update is always reported as failed (with the reason when the site could not reach itself to check the new version), maintenance mode is cleared if an update is interrupted, and WPVibe records a note whenever it had to switch itself back on.
+* Fix: Approved database writes no longer fail with "Multiple SQL statements" when a quoted value contains a semicolon, such as serialized data or CSS. Anything the check cannot read with certainty is still refused.
+* Fix: When another plugin or theme crashes while WPVibe saves an edit, administrators see the PHP error with its file, line and the plugin or theme it came from, instead of WordPress's bare "critical error". Your AI is told to check whether the change was saved rather than send the same edit again.
+* Fix: An upload your site refuses because of its file type (for example an SVG blocked by an SVG plugin) is reported as an unsupported file type with the site's own message, not as a disk error, so your AI stops retrying it.
+* Fix: Menu changes no longer fail on sites whose plugins look up the admin screen when a menu is saved (for example Ocean Extra).
+* Fix: The plugin page now names the right Wordfence screen (All Options, Brute Force Protection) for the setting that turns off application passwords.
+* Fix: Astra child themes are recognized in the dashboard widget and when WPVibe picks the right Astra tools.
+* Improvement: When a site refuses WPVibe's sign-in, the connection check reports a few more facts about why (whether the server passed the credentials through and whether WordPress's application password check ran), never the credentials themselves.
+
 = 1.20.4 =
 * Fix: When WPVibe updates itself, it stays switched on. Before, an update WPVibe ran on its own (from your AI or a fleet job) could leave the plugin deactivated until someone turned it back on. The update now runs the way WordPress's own background updates do, so WordPress also checks the new version for errors and restores the previous one if it would break the site.
 * Improvement: Beaver Builder pages save on Beaver Builder versions before 2.6. When a save hits a PHP error, administrators see the error with its file and line, and a page the failed save created is removed.
@@ -356,19 +367,6 @@ No. WPVibe lets you manage your WordPress site entirely through conversation wit
 
 = 1.16.3 =
 * Fix: sites on XSERVER with the WAF "Command" rule enabled can connect again. That rule blocks any URL containing "ping", which was the name of the route WPVibe checks before connecting. The check now also answers at /wpvibe/v1/health, and the plugin's own self-update loopback moved off that word too. The /ping route stays for older connections.
-
-= 1.16.2 =
-* Fix: on sites that lock the file editor (DISALLOW_FILE_EDIT or DISALLOW_FILE_MODS), the read-only theme tools work again: listing files, reading a file, previews, and page HTML. Reads come from the draft theme when one exists and otherwise from the active theme, so a site can be inspected before an edit is proposed. Writes and draft creation stay locked.
-* Improvement: the reminder that deactivating or deleting WPVibe does not disconnect the site has moved off the Plugins screen and onto the WPVibe settings page, shown once the site is connected. The confirm on Deactivate stays.
-* Hardening: once a site has a proof key, the routes that require one refuse a request without it instead of falling back to plain authentication, including the window between a reconnect and the first signed call.
-* Hardening: after a reconnect, only the application password that reconnect created can register the next proof key, so a credential entered by hand cannot seed one.
-* Hardening: the proof-key options are blocked from `option get`, `option update`, and `option delete`.
-
-= 1.16.1 =
-* Fix: uploading a file type WordPress does not allow (or an empty file) now says so, with the extension and where to allow it, instead of reporting a filesystem error that sent people checking folder permissions.
-* Fix: reading a translated page's HTML on a WPML site with language directories now returns that language's page instead of the default one.
-* Feature: the WPVibe row on the Plugins screen explains that deactivating or deleting the plugin does not disconnect the site or revoke its application password, with links to do both, and a confirm on Deactivate says the same before the plugin's code stops running.
-* Fix: `comment create` now applies WordPress's comment filtering for authors who lack the unfiltered_html capability (non-super-admins on multisite, sites with DISALLOW_UNFILTERED_HTML), matching what core does for those users.
 
 = Older versions =
 WP.org caps the changelog at 5,000 words. For the full release history back to 1.0.0, see https://wpvibe.ai/changelog/

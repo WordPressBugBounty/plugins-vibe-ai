@@ -130,7 +130,7 @@ class WPVibe_App_Password_Policy {
 	// Plugins that disable with core's __return_false leave no file to attribute, so check their settings directly.
 	private static function known_blocker() {
 		if ( class_exists( 'wfConfig' ) && method_exists( 'wfConfig', 'get' ) && wfConfig::get( 'loginSec_disableApplicationPasswords' ) ) {
-			return array( 'name' => 'Wordfence', 'basename' => 'wordfence/wordfence.php', 'setting' => __( 'Login Security > Settings > Disable WordPress application passwords', 'vibe-ai' ) );
+			return array( 'name' => 'Wordfence', 'basename' => 'wordfence/wordfence.php', 'setting' => __( 'All Options > Brute Force Protection > Disable WordPress application passwords', 'vibe-ai' ) );
 		}
 		if ( class_exists( 'ITSEC_Modules' ) && method_exists( 'ITSEC_Modules', 'get_setting' ) && ITSEC_Modules::get_setting( 'wordpress-tweaks', 'disable_application_passwords' ) ) {
 			return array( 'name' => 'Solid Security', 'basename' => 'better-wp-security/better-wp-security.php', 'setting' => __( 'Settings > WordPress Tweaks > Disable Application Passwords', 'vibe-ai' ) );

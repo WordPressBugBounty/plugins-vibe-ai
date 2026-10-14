@@ -319,21 +319,22 @@ class WPVibe_Dashboard_Widget {
 				$dirs[ strtolower( strtok( (string) $path, '/' ) ) ] = true;
 			}
 		}
-		$theme = strtolower( get_stylesheet() );
+		// A child theme with any slug matches through its parent (template), like detectBuilders in the Worker.
+		$themes = array_unique( array_filter( array( strtolower( get_stylesheet() ), strtolower( get_template() ) ) ) );
 
 		$stack = array();
 		foreach ( $map as $id => $matcher ) {
 			if ( ! is_array( $matcher ) ) {
 				continue;
 			}
-			if ( $this->matcher_hits( $matcher, $dirs, $theme ) ) {
+			if ( $this->matcher_hits( $matcher, $dirs, $themes ) ) {
 				$stack[] = sanitize_key( $id );
 			}
 		}
 		return $stack;
 	}
 
-	private function matcher_hits( $matcher, $dirs, $theme ) {
+	private function matcher_hits( $matcher, $dirs, $themes ) {
 		foreach ( (array) ( isset( $matcher['dirs'] ) ? $matcher['dirs'] : array() ) as $dir ) {
 			if ( isset( $dirs[ strtolower( (string) $dir ) ] ) ) {
 				return true;
@@ -350,7 +351,7 @@ class WPVibe_Dashboard_Widget {
 				}
 			}
 		}
-		if ( '' !== $theme ) {
+		foreach ( $themes as $theme ) {
 			foreach ( (array) ( isset( $matcher['themes'] ) ? $matcher['themes'] : array() ) as $t ) {
 				if ( strtolower( (string) $t ) === $theme ) {
 					return true;

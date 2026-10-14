@@ -1311,6 +1311,7 @@ class WPVibe_REST {
 			'active_theme' => array(
 				'name'              => $theme->get( 'Name' ),
 				'stylesheet'        => get_stylesheet(),
+				'template'          => get_template(),
 				'version'           => $theme->get( 'Version' ),
 				'wpvibe_authored'   => 'yes' === strtolower( trim( (string) $theme->get( 'WPVibe' ) ) ),
 				'uses_tailwind'     => file_exists( $theme_dir . '/theme.css' ),
@@ -1345,15 +1346,37 @@ class WPVibe_REST {
 
 	public function edit_content( $request ) {
 		list( $type, $args ) = $this->content_target( $request );
-		$content_ops = new WPVibe_Content_Ops();
-		return $content_ops->edit(
-			$type,
-			$args,
-			$request->get_param( 'old_content' ),
-			$request->get_param( 'new_content' ),
-			(bool) $request->get_param( 'replace_all' ),
-			(bool) $request->get_param( 'whole_word' )
-		);
+		add_filter( 'wp_php_error_message', array( __CLASS__, 'edit_fatal_message' ), 10, 2 );
+		try {
+			$content_ops = new WPVibe_Content_Ops();
+			return $content_ops->edit(
+				$type,
+				$args,
+				$request->get_param( 'old_content' ),
+				$request->get_param( 'new_content' ),
+				(bool) $request->get_param( 'replace_all' ),
+				(bool) $request->get_param( 'whole_word' )
+			);
+		} catch ( \Throwable $e ) {
+			$where = WPVibe_Error_Contract::php_error_location( $e->getMessage(), $e->getFile(), $e->getLine(), $e->getTrace() );
+			return new WP_Error( 'content_edit_fatal', sprintf(
+				/* translators: 1: error detail or a generic note 2: recovery advice */
+				__( 'The edit stopped with a PHP error in the site\'s code: %1$s. %2$s', 'vibe-ai' ),
+				'' !== $where ? $where : __( 'details are shown to administrators only', 'vibe-ai' ),
+				self::edit_fatal_advice()
+			), WPVibe_Error_Contract::data( 'wp_core', false, array( 'status' => 500 ) ) );
+		} finally {
+			remove_filter( 'wp_php_error_message', array( __CLASS__, 'edit_fatal_message' ), 10 );
+		}
+	}
+
+	// An uncatchable fatal (memory, time limit) during content/edit: administrators get the cause in WordPress's own error body.
+	public static function edit_fatal_message( $message, $error ) {
+		return WPVibe_Error_Contract::fatal_message( $message, $error, 'content/edit fatal', self::edit_fatal_advice() );
+	}
+
+	private static function edit_fatal_advice() {
+		return __( 'The change may already be stored, because WordPress writes it before most save hooks run: read the target back before doing anything else, and do not resend the same edit, because the same code fails the same way. The fix belongs in the plugin or theme that raised the error (update or deactivate it), or make this change in wp-admin. When the message names WordPress core or WPVibe itself, never deactivate WPVibe (it is this connection): report the message to WPVibe support.', 'vibe-ai' );
 	}
 
 	public function search_content( $request ) {
@@ -1740,13 +1763,54 @@ class WPVibe_REST {
 	}
 
 	/**
-	 * Wrap a media_handle_sideload() failure that passed the type gate: what is
-	 * left is the move/write/directory family, so the filesystem cause holds.
+	 * media_handle_sideload(), telling a refusal by an upload prefilter (another
+	 * plugin's SVG sanitizer or file rule) apart from a filesystem failure: core
+	 * wraps both as the same upload_error.
+	 *
+	 * @param array  $file_array name + tmp_name.
+	 * @param int    $post_id    Parent post.
+	 * @param string $title      Attachment title.
+	 * @return int|WP_Error Attachment id, or the wrapped failure.
+	 */
+	private static function media_sideload( array $file_array, $post_id, $title ) {
+		$refused = false;
+		$watch   = function ( $file ) use ( &$refused, $file_array ) {
+			if ( is_array( $file ) && ( $file['tmp_name'] ?? null ) === $file_array['tmp_name'] ) {
+				$refused = isset( $file['error'] ) && ! is_numeric( $file['error'] ) && $file['error'];
+			}
+			return $file;
+		};
+		add_filter( 'wp_handle_sideload_prefilter', $watch, PHP_INT_MAX );
+		try {
+			$id = media_handle_sideload( $file_array, $post_id, $title );
+		} finally {
+			remove_filter( 'wp_handle_sideload_prefilter', $watch, PHP_INT_MAX );
+		}
+		return is_wp_error( $id ) ? self::sideload_failure_error( $id, $refused ) : $id;
+	}
+
+	/**
+	 * Wrap a media_handle_sideload() failure that passed the type gate. A refusal
+	 * by an upload prefilter or core's own type check is the site's upload rules;
+	 * what is left is the move/write/directory family, so the filesystem cause holds.
 	 *
 	 * @param WP_Error $inner
+	 * @param bool     $refused Whether an upload prefilter set the error.
 	 * @return WP_Error
 	 */
-	public static function sideload_failure_error( $inner ) {
+	public static function sideload_failure_error( $inner, $refused = false ) {
+		$message = $inner->get_error_message();
+		if ( $refused || __( 'Sorry, you are not allowed to upload this file type.' ) === $message ) {
+			return new WP_Error(
+				'invalid_file_type',
+				sprintf(
+					/* translators: %s: the site's own refusal message */
+					__( 'This site refused the file before saving it ("%s"). One of the site\'s upload rules turned it away: the allowed file types, or another plugin\'s upload filter, such as an SVG plugin that could not sanitize the file or that limits who may upload SVG. Resending the same file gets the same answer. Use a PNG or JPG instead, or ask a site administrator to allow this file in that plugin\'s settings or the site\'s allowed file types.', 'vibe-ai' ),
+					$message
+				),
+				WPVibe_Error_Contract::data( 'not_supported', false, array( 'status' => 415, 'inner_code' => (string) $inner->get_error_code() ) )
+			);
+		}
 		return new WP_Error(
 			'upload_failed',
 			sprintf(
@@ -1873,12 +1937,12 @@ class WPVibe_REST {
 			);
 
 			// Sideload into the media library.
-			$attachment_id = media_handle_sideload( $file_array, $post_id, $title );
+			$attachment_id = self::media_sideload( $file_array, $post_id, $title );
 
 			// Clean up temp file if sideload failed.
 			if ( is_wp_error( $attachment_id ) ) {
 				wp_delete_file( $tmp );
-				return self::sideload_failure_error( $attachment_id );
+				return $attachment_id;
 			}
 		}
 
@@ -1998,7 +2062,7 @@ class WPVibe_REST {
 		add_filter( 'wp_check_filetype_and_ext', $vouch, 99, 3 );
 		try {
 			$rejection = self::check_sideload_file( $tmp, $name, false, 'image/svg+xml' );
-			$id        = is_wp_error( $rejection ) ? $rejection : media_handle_sideload( array( 'name' => $name, 'tmp_name' => $tmp ), $post_id, $title );
+			$id        = is_wp_error( $rejection ) ? $rejection : self::media_sideload( array( 'name' => $name, 'tmp_name' => $tmp ), $post_id, $title );
 		} finally {
 			remove_filter( 'wp_check_filetype_and_ext', $vouch, 99 );
 		}
@@ -2006,7 +2070,7 @@ class WPVibe_REST {
 			return $rejection;
 		}
 		if ( is_wp_error( $id ) ) {
-			return self::sideload_failure_error( $id );
+			return $id;
 		}
 		self::store_svg_metadata( (int) $id, $result['content'] );
 

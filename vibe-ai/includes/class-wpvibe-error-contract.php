@@ -36,6 +36,9 @@ if ( ! defined( 'ABSPATH' ) ) {
 
 class WPVibe_Error_Contract {
 
+	/** @var bool|null Last application_password_is_api_request verdict core received; null until core asks. */
+	private static $api_request = null;
+
 	/**
 	 * Build a WP_Error data array carrying the structured contract fields.
 	 *
@@ -78,13 +81,115 @@ class WPVibe_Error_Contract {
 		return array(
 			// Constants are set in vibe-ai.php before anything can rewrite
 			// $_SERVER, so these describe what the server delivered.
-			'auth_header_seen'        => defined( 'WPVIBE_AUTH_HEADER_SEEN' ) ? (bool) WPVIBE_AUTH_HEADER_SEEN : null,
-			'auth_fallback_seen'      => defined( 'WPVIBE_AUTH_FALLBACK_SEEN' ) ? (bool) WPVIBE_AUTH_FALLBACK_SEEN : null,
-			'auth_fallback_applied'   => defined( 'WPVIBE_AUTH_FALLBACK_APPLIED' ) ? (bool) WPVIBE_AUTH_FALLBACK_APPLIED : null,
-			'app_passwords_available' => function_exists( 'wp_is_application_passwords_available' ) ? (bool) wp_is_application_passwords_available() : null,
-			'app_passwords_in_use'    => self::app_passwords_in_use(),
-			'is_ssl'                  => is_ssl(),
+			'auth_header_seen'         => defined( 'WPVIBE_AUTH_HEADER_SEEN' ) ? (bool) WPVIBE_AUTH_HEADER_SEEN : null,
+			'auth_fallback_seen'       => defined( 'WPVIBE_AUTH_FALLBACK_SEEN' ) ? (bool) WPVIBE_AUTH_FALLBACK_SEEN : null,
+			'auth_fallback_applied'    => defined( 'WPVIBE_AUTH_FALLBACK_APPLIED' ) ? (bool) WPVIBE_AUTH_FALLBACK_APPLIED : null,
+			'app_passwords_available'  => function_exists( 'wp_is_application_passwords_available' ) ? (bool) wp_is_application_passwords_available() : null,
+			'app_passwords_in_use'     => self::app_passwords_in_use(),
+			'is_ssl'                   => is_ssl(),
+			// Core's silent exits in wp_validate_application_password(), as booleans only (never the values).
+			'php_auth_user_set'        => isset( $_SERVER['PHP_AUTH_USER'] ),
+			'php_auth_pw_set'          => isset( $_SERVER['PHP_AUTH_PW'] ),
+			'app_password_api_request' => self::$api_request,
+			'app_password_auth_hooked' => false !== has_filter( 'determine_current_user', 'wp_validate_application_password' ),
 		);
+	}
+
+	/**
+	 * Remember the final application_password_is_api_request verdict (hooked last),
+	 * so a 401 reports the value core acted on rather than a recomputed one.
+	 *
+	 * @param mixed $is_api_request Filtered value.
+	 * @return mixed Unchanged.
+	 */
+	public static function record_api_request( $is_api_request ) {
+		self::$api_request = (bool) $is_api_request;
+		return $is_api_request;
+	}
+
+	/**
+	 * Where a PHP error came from, for administrators only: the message, the
+	 * site-relative file:line and the plugin or theme that owns that file.
+	 *
+	 * @param string $message PHP error message.
+	 * @param string $file    Absolute file path.
+	 * @param int    $line    Line number.
+	 * @param array  $trace   Backtrace, used to name the caller when the error sits in WordPress core.
+	 * @return string Empty for non-administrators.
+	 */
+	public static function php_error_location( $message, $file, $line, array $trace = array() ) {
+		if ( ! current_user_can( 'manage_options' ) ) {
+			return '';
+		}
+		$owner = self::is_own_file( $file ) ? 'WPVibe itself' : self::code_owner( $file );
+		if ( 'WordPress core' === $owner ) {
+			// Name the plugin or theme that called into core; WPVibe is always on the stack in content/edit, so it never counts.
+			foreach ( $trace as $frame ) {
+				if ( ! isset( $frame['file'] ) || self::is_own_file( $frame['file'] ) ) {
+					continue;
+				}
+				$caller = self::code_owner( $frame['file'] );
+				if ( '' !== $caller && 'WordPress core' !== $caller ) {
+					$owner = sprintf( 'WordPress core, called from %s', $caller );
+					break;
+				}
+			}
+		}
+		$where = WPVibe_Draft_Theme::site_relative( sprintf( '%s in %s:%d', $message, $file, (int) $line ) );
+		return '' === $owner ? $where : sprintf( '%s (%s)', $where, $owner );
+	}
+
+	/**
+	 * Whether a file is part of this plugin, whatever its folder is called.
+	 *
+	 * @param string $file Absolute path.
+	 * @return bool
+	 */
+	public static function is_own_file( $file ) {
+		if ( ! defined( 'WPVIBE_PLUGIN_DIR' ) || '' === (string) $file ) {
+			return false;
+		}
+		$dir = wp_normalize_path( WPVIBE_PLUGIN_DIR );
+		return 0 === strpos( wp_normalize_path( (string) $file ), trailingslashit( $dir ) );
+	}
+
+	/**
+	 * The plugin, theme or core area a file belongs to, by its place under the site root.
+	 *
+	 * @param string $file Absolute or site-relative path.
+	 * @return string Empty when the file is outside the known folders.
+	 */
+	public static function code_owner( $file ) {
+		$rel = WPVibe_Draft_Theme::site_relative( (string) $file );
+		if ( preg_match( '#^wp-content/(plugins|mu-plugins|themes)/([^/]+)#', $rel, $m ) ) {
+			$labels = array( 'plugins' => 'plugin', 'mu-plugins' => 'must-use plugin', 'themes' => 'theme' );
+			return $labels[ $m[1] ] . ' ' . preg_replace( '/\.php$/', '', $m[2] );
+		}
+		if ( preg_match( '#^wp-(includes|admin)/#', $rel ) ) {
+			return 'WordPress core';
+		}
+		return '';
+	}
+
+	/**
+	 * Detail for WordPress's own fatal-error message (wp_php_error_message), so an
+	 * uncatchable fatal (memory, time limit) names its cause for administrators.
+	 *
+	 * @param string $message Core's message.
+	 * @param mixed  $error   error_get_last() array.
+	 * @param string $label   What was running, e.g. "Beaver save fatal".
+	 * @param string $advice  Optional recovery line appended after the detail.
+	 * @return string
+	 */
+	public static function fatal_message( $message, $error, $label, $advice = '' ) {
+		if ( ! is_array( $error ) ) {
+			return $message;
+		}
+		$where = self::php_error_location( $error['message'] ?? '', $error['file'] ?? '', (int) ( $error['line'] ?? 0 ) );
+		if ( '' === $where ) {
+			return $message;
+		}
+		return $message . ' ' . esc_html( trim( sprintf( '%s: %s %s', $label, $where, $advice ) ) );
 	}
 
 	/**

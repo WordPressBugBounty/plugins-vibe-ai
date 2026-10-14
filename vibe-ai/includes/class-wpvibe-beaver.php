@@ -102,15 +102,13 @@ class WPVibe_Beaver {
 	}
 
 	private function error_detail( \Throwable $e ) {
-		return current_user_can( 'manage_options' ) ? WPVibe_Draft_Theme::site_relative( $e->getMessage() . ' in ' . $e->getFile() . ':' . $e->getLine() ) : __( 'details are shown to administrators only', 'vibe-ai' );
+		$where = WPVibe_Error_Contract::php_error_location( $e->getMessage(), $e->getFile(), $e->getLine(), $e->getTrace() );
+		return '' !== $where ? $where : __( 'details are shown to administrators only', 'vibe-ai' );
 	}
 
 	// An uncatchable fatal (memory, time limit) during a save: administrators get the cause in the REST error body.
 	public function fatal_detail( $message, $error ) {
-		if ( ! is_array( $error ) || ! current_user_can( 'manage_options' ) ) {
-			return $message;
-		}
-		return $message . ' ' . esc_html( WPVibe_Draft_Theme::site_relative( sprintf( 'Beaver save fatal: %s in %s:%d', $error['message'] ?? '', $error['file'] ?? '', (int) ( $error['line'] ?? 0 ) ) ) );
+		return WPVibe_Error_Contract::fatal_message( $message, $error, 'Beaver save fatal' );
 	}
 
 	private function do_save_page( WP_REST_Request $request ) {

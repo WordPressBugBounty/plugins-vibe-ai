@@ -79,7 +79,7 @@ class WPVibe_Edit_Affordance {
 	 * surrounding row.
 	 */
 	public function enqueue_admin_focus_assets( $hook ) {
-		$screen = get_current_screen();
+		$screen = function_exists( 'get_current_screen' ) ? get_current_screen() : null;
 		$ok     = in_array( $hook, array( 'post.php', 'post-new.php' ), true )
 			|| ( $screen && 'settings_page_' . WPVibe_Settings::PAGE_SLUG === $screen->id );
 		if ( ! $ok ) {

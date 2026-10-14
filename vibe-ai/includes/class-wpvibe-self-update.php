@@ -36,6 +36,9 @@ class WPVibe_Self_Update {
 
 	private static $instance = null;
 
+	/** Set while this process holds the auto_updater lock; what the shutdown recovery needs. */
+	private $run_guard = null;
+
 	public static function instance() {
 		if ( null === self::$instance ) {
 			self::$instance = new self();
@@ -233,6 +236,8 @@ class WPVibe_Self_Update {
 		$to     = (string) ( $state['to_version'] ?? '' );
 		$expect = (string) ( $state['expect_version'] ?? '' );
 
+		$was_active         = false;
+		$was_network        = false;
 		try {
 			if ( defined( 'DISALLOW_FILE_MODS' ) && DISALLOW_FILE_MODS ) {
 				return $this->finish_failed( $from, $to, __( 'File modifications are disabled (DISALLOW_FILE_MODS).', 'vibe-ai' ), false );
@@ -268,6 +273,24 @@ class WPVibe_Self_Update {
 			require_once ABSPATH . 'wp-admin/includes/admin.php';
 			require_once ABSPATH . 'wp-admin/includes/class-wp-upgrader.php';
 
+			// Held by core's run(): keeps a core background update from overlapping or nesting in ours.
+			if ( ! $this->auto_updater_lock( true ) ) {
+				return $this->finish_failed( $from, $to, __( 'WordPress is running its own updates right now, so WPVibe did not start its update. Try again in a few minutes.', 'vibe-ai' ), false );
+			}
+			// Core ignores a marker older than 10 minutes, so an expired one is not someone else's live maintenance.
+			$marker          = ABSPATH . '.maintenance';
+			$this->run_guard = array(
+				'maintenance_before' => file_exists( $marker ) && ( time() - (int) @filemtime( $marker ) ) < 10 * MINUTE_IN_SECONDS, // phpcs:ignore WordPress.PHP.NoSilencedErrors
+				'from'               => $from,
+				'to'                 => $to,
+				'was_active'         => false,
+				'was_network'        => false,
+			);
+			// A timeout, memory exhaustion or exit skips catch and finally.
+			register_shutdown_function( function () {
+				$this->recover_interrupted_run();
+			} );
+
 			// Plugin_Upgrader::upgrade() (which the automatic updater calls) silently
 			// deactivates the plugin unless wp_doing_cron(), and this runs in-request
 			// or by loopback, so WPVibe came back switched off on every site that
@@ -276,6 +299,8 @@ class WPVibe_Self_Update {
 			$was_active  = is_plugin_active( WPVIBE_PLUGIN_BASENAME );
 			$was_network = is_multisite() && function_exists( 'is_plugin_active_for_network' )
 				&& is_plugin_active_for_network( WPVIBE_PLUGIN_BASENAME );
+			$this->run_guard['was_active']  = $was_active;
+			$this->run_guard['was_network'] = $was_network;
 
 			$result    = null;
 			$used_auto = false;
@@ -322,18 +347,25 @@ class WPVibe_Self_Update {
 			// old code, so WPVIBE_VERSION cannot tell whether files were swapped.
 			$disk         = get_plugin_data( WP_PLUGIN_DIR . '/vibe-ai/vibe-ai.php', false, false );
 			$disk_version = isset( $disk['Version'] ) ? (string) $disk['Version'] : '';
-			$reactivated  = $was_active && $this->reactivate( $was_network );
+			$reactivation = $was_active ? $this->reactivate( $was_network ) : false;
+			$reactivated  = true === $reactivation;
 			$active       = is_plugin_active( WPVIBE_PLUGIN_BASENAME );
+			$warning      = $this->reactivation_warning( $was_active, $active, $reactivation );
 
-			if ( '' !== $disk_version && $disk_version !== $from ) {
-				update_option( self::OPTION, array(
+			// A WP_Error outranks the disk version: a failed rollback leaves the new files in place.
+			if ( ! is_wp_error( $result ) && '' !== $disk_version && $disk_version !== $from ) {
+				$success = array(
 					'status'       => 'success',
 					'from_version' => $from,
 					'to_version'   => $disk_version,
 					'finished_at'  => time(),
 					'still_active' => (bool) $active,
 					'reactivated'  => $reactivated,
-				), false );
+				);
+				if ( '' !== $warning ) {
+					$success['warning'] = $warning;
+				}
+				update_option( self::OPTION, $success, false );
 				WPVibe_Change_Tracker::mark( array(
 					'summary'      => "WPVibe updated: {$from} -> {$disk_version}",
 					'action_label' => 'Manage Plugins',
@@ -342,14 +374,92 @@ class WPVibe_Self_Update {
 				return true;
 			}
 
-			$rolled_back = $used_auto && is_wp_error( $result );
+			$code        = is_wp_error( $result ) ? (string) $result->get_error_code() : '';
+			$rolled_back = 'plugin_update_fatal_error_rollback_successful' === $code;
 			$error       = is_wp_error( $result )
 				? $result->get_error_message()
 				: __( 'The plugin files were not replaced; the installed version is unchanged.', 'vibe-ai' );
-			return $this->finish_failed( $from, $to, $error, $rolled_back );
+			if ( $rolled_back && $this->home_unreachable() ) {
+				$error = __( 'WordPress restored the previous version because this site could not load its own home page to check the new one (the loopback request failed), not because the update itself is known to be broken. Update WPVibe from the Plugins screen in wp-admin, which does not run that check, or ask the host to allow the site to reach itself.', 'vibe-ai' );
+			}
+			$extra = array();
+			if ( 'plugin_update_fatal_error_rollback_failed' === $code ) {
+				$extra['rollback_failed'] = true;
+				$extra['disk_version']    = $disk_version;
+				/* translators: %s: version now on disk */
+				$error .= ' ' . sprintf( __( 'The files on disk are now version %s; check that the site loads and that WPVibe is active on the Plugins screen.', 'vibe-ai' ), '' !== $disk_version ? $disk_version : '?' );
+			}
+			if ( '' !== $warning ) {
+				$extra['warning'] = $warning;
+			}
+			return $this->finish_failed( $from, $to, $error, $rolled_back, $extra );
 		} catch ( \Throwable $e ) {
-			return $this->finish_failed( $from, $to, $e->getMessage(), false );
+			$this->remove_own_maintenance();
+			$warning = $was_active ? $this->reactivate_after_failure( $was_network ) : '';
+			return $this->finish_failed( $from, $to, $e->getMessage(), false, '' !== $warning ? array( 'warning' => $warning ) : array() );
+		} finally {
+			if ( null !== $this->run_guard ) {
+				$this->run_guard = null;
+				$this->auto_updater_lock( false );
+			}
 		}
+	}
+
+	/** Core keeps this lock in the main site's options; on multisite take it there, not on the calling subsite. */
+	private function auto_updater_lock( $acquire ) {
+		$switch = is_multisite() && ! is_main_site( null, get_main_network_id() );
+		if ( $switch ) {
+			switch_to_blog( get_main_site_id( get_main_network_id() ) );
+		}
+		try {
+			return $acquire ? WP_Upgrader::create_lock( 'auto_updater' ) : WP_Upgrader::release_lock( 'auto_updater' );
+		} finally {
+			if ( $switch ) {
+				restore_current_blog();
+			}
+		}
+	}
+
+	private function remove_own_maintenance() {
+		if ( is_array( $this->run_guard ) && ! $this->run_guard['maintenance_before'] && file_exists( ABSPATH . '.maintenance' ) ) {
+			@unlink( ABSPATH . '.maintenance' ); // phpcs:ignore WordPress.PHP.NoSilencedErrors
+		}
+	}
+
+	/** Shutdown after the process died mid-run: no throw, no finally, so undo what the run owns here. */
+	private function recover_interrupted_run() {
+		if ( null === $this->run_guard ) {
+			return;
+		}
+		$guard = $this->run_guard;
+		$this->remove_own_maintenance();
+		$warning         = $guard['was_active'] ? $this->reactivate_after_failure( $guard['was_network'] ) : '';
+		$this->run_guard = null;
+		$this->auto_updater_lock( false );
+		$state = get_option( self::OPTION, array() );
+		if ( is_array( $state ) && 'running' === ( $state['status'] ?? '' ) ) {
+			$this->finish_failed( $guard['from'], $guard['to'], __( 'The update process was stopped before it finished (a PHP time or memory limit, or a fatal error). Check the installed version with `plugin get vibe-ai` and make sure WPVibe is active on the Plugins screen.', 'vibe-ai' ), false, '' !== $warning ? array( 'warning' => $warning ) : array() );
+		}
+	}
+
+	/** Switch WPVibe back on after a run that died or threw; returns the warning to record, if any. */
+	private function reactivate_after_failure( $network_wide ) {
+		try {
+			$reactivation = $this->reactivate( $network_wide );
+			return $this->reactivation_warning( true, is_plugin_active( WPVIBE_PLUGIN_BASENAME ), $reactivation );
+		} catch ( \Throwable $e ) {
+			return __( 'WPVibe may be switched off after the failed update. Check the Plugins screen and activate it if needed.', 'vibe-ai' );
+		}
+	}
+
+	/** Same check core's has_fatal_error() makes: only a transport failure counts as unreachable. */
+	private function home_unreachable() {
+		$url = home_url( '/' );
+		$res = wp_remote_get( $url, array(
+			'timeout'   => 10,
+			'sslverify' => apply_filters( 'https_local_ssl_verify', false, $url ),
+		) );
+		return is_wp_error( $res );
 	}
 
 	/**
@@ -381,25 +491,47 @@ class WPVibe_Self_Update {
 	 * something still dropped it, switch it back on silently (only the
 	 * active_plugins option, no activation hooks). Nothing here test-loads the
 	 * new code: include_once skips the already-loaded main file.
-	 * True when it had to switch the plugin back on.
+	 * True when it switched the plugin back on, false when nothing was needed,
+	 * WP_Error when it could not.
 	 */
 	private function reactivate( $network_wide ) {
 		if ( is_plugin_active( WPVIBE_PLUGIN_BASENAME ) ) {
 			return false;
 		}
 		$res = activate_plugin( WPVIBE_PLUGIN_BASENAME, '', (bool) $network_wide, true );
-		return ! is_wp_error( $res ) && is_plugin_active( WPVIBE_PLUGIN_BASENAME );
+		if ( is_wp_error( $res ) ) {
+			return $res;
+		}
+		return is_plugin_active( WPVIBE_PLUGIN_BASENAME )
+			? true
+			: new WP_Error( 'wpvibe_reactivate_failed', __( 'it is still not in the active plugins list', 'vibe-ai' ) );
 	}
 
-	private function finish_failed( $from, $to, $error, $rolled_back ) {
-		update_option( self::OPTION, array(
+	/** Empty unless the fallback had to act: a silent switch-on skips activation hooks and never test-loads the new code. */
+	private function reactivation_warning( $was_active, $active, $reactivation ) {
+		if ( ! $was_active ) {
+			return '';
+		}
+		if ( ! $active ) {
+			$why = is_wp_error( $reactivation ) ? $reactivation->get_error_message() : __( 'unknown reason', 'vibe-ai' );
+			/* translators: %s: why activation failed */
+			return sprintf( __( 'WordPress switched WPVibe off during the update and it could not be switched back on (%s). Activate WPVibe from the Plugins screen in wp-admin.', 'vibe-ai' ), $why );
+		}
+		if ( true === $reactivation ) {
+			return __( 'WordPress switched WPVibe off during the update; it was switched back on without running its activation step. If something looks wrong, deactivate and reactivate WPVibe from the Plugins screen.', 'vibe-ai' );
+		}
+		return '';
+	}
+
+	private function finish_failed( $from, $to, $error, $rolled_back, array $extra = array() ) {
+		update_option( self::OPTION, array_merge( array(
 			'status'       => 'failed',
 			'from_version' => (string) $from,
 			'to_version'   => (string) $to,
 			'error'        => (string) $error,
 			'rolled_back'  => (bool) $rolled_back,
 			'finished_at'  => time(),
-		), false );
+		), $extra ), false );
 		return false;
 	}
 }

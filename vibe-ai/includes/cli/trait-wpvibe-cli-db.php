@@ -263,6 +263,59 @@ trait WPVibe_CLI_Db {
 	}
 
 
+	/** A `;` with SQL after it outside quoted literals; any doubt about where a literal ends (sql_mode, charset, comments, no closing quote) counts too. */
+	private function sql_has_second_statement( $sql ) {
+		if ( ! preg_match( '/;\s*\S/', $sql ) ) {
+			return false;
+		}
+		// GBK, Big5 and SJIS can read a high byte plus a following backslash or backtick as one character.
+		if ( preg_match( '/[\x80-\xFF][\\\\`]/', $sql ) ) {
+			return true;
+		}
+		foreach ( array( '\'"', '\'', '' ) as $backslash_quotes ) {
+			$masked = $this->mask_sql_literals( $sql, $backslash_quotes );
+			// Outside literals only plain SQL may remain: anything else can open a comment or a quoting form the mask does not know ([ident], $$body$$).
+			if ( null === $masked || preg_match( '#;\s*\S|--|/\*|[^A-Za-z0-9_\s,.()=<>!+\-*/%&|^~:@?;]#', $masked ) ) {
+				return true;
+			}
+		}
+		return false;
+	}
+
+	/** Quoted literals replaced with `?`, once per quote char in $backslash_quotes honouring backslash escapes; null on an unterminated literal. */
+	private function mask_sql_literals( $sql, $backslash_quotes ) {
+		$out = '';
+		$len = strlen( $sql );
+		for ( $i = 0; $i < $len; $i++ ) {
+			$c = $sql[ $i ];
+			if ( "'" !== $c && '"' !== $c && '`' !== $c ) {
+				$out .= $c;
+				continue;
+			}
+			$backslash = false !== strpos( $backslash_quotes, $c );
+			for ( $j = $i + 1; ; $j++ ) {
+				if ( $j >= $len ) {
+					return null;
+				}
+				if ( $backslash && '\\' === $sql[ $j ] ) {
+					$j++;
+					continue;
+				}
+				if ( $c === $sql[ $j ] ) {
+					if ( $j + 1 < $len && $c === $sql[ $j + 1 ] ) {
+						$j++;
+						continue;
+					}
+					break;
+				}
+			}
+			$out .= '?';
+			$i    = $j;
+		}
+		return $out;
+	}
+
+
 	private function handle_db_query( $positional, $flags ) {
 		global $wpdb;
 
@@ -275,7 +328,7 @@ trait WPVibe_CLI_Db {
 		$sql = str_replace( '{prefix}', $wpdb->prefix, $sql );
 
 		// One statement at a time (a trailing semicolon is fine).
-		if ( preg_match( '/;\s*\S/', $sql ) ) {
+		if ( $this->sql_has_second_statement( $sql ) ) {
 			return $this->error_result( __( 'Multiple SQL statements are not allowed. Run one statement at a time.', 'vibe-ai' ) );
 		}
 

@@ -131,7 +131,7 @@ class WPVibe_Meta_Boxes {
 	 * @param string $hook
 	 */
 	public function enqueue_assets( $hook ) {
-		$screen = get_current_screen();
+		$screen = function_exists( 'get_current_screen' ) ? get_current_screen() : null;
 		if ( ! $screen ) {
 			return;
 		}

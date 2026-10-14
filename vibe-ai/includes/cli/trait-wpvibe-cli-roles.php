@@ -497,9 +497,16 @@ trait WPVibe_CLI_Roles {
 		// keys first so no prefix shape can slip role/level storage through.
 		global $wpdb;
 		if ( isset( $wpdb ) ) {
-			$prefix = strtolower( (string) ( method_exists( $wpdb, 'get_blog_prefix' ) ? $wpdb->get_blog_prefix() : ( $wpdb->prefix ?? '' ) ) );
-			if ( '' !== $prefix && ( $k === $prefix . 'capabilities' || $k === $prefix . 'user_level' ) ) {
-				return true;
+			// base_prefix too: on a multisite subsite the main site's keys use it, not the blog prefix.
+			$prefixes = array(
+				method_exists( $wpdb, 'get_blog_prefix' ) ? $wpdb->get_blog_prefix() : ( $wpdb->prefix ?? '' ),
+				$wpdb->base_prefix ?? '',
+			);
+			foreach ( $prefixes as $prefix ) {
+				$prefix = strtolower( (string) $prefix );
+				if ( '' !== $prefix && ( $k === $prefix . 'capabilities' || $k === $prefix . 'user_level' ) ) {
+					return true;
+				}
 			}
 		}
 		foreach ( self::USER_META_HARD_DENY_PATTERNS as $pattern ) {
@@ -508,6 +515,18 @@ trait WPVibe_CLI_Roles {
 			}
 		}
 		return false;
+	}
+
+	/** Every stored meta_key the live collation binds $key to for this user; no DISTINCT, which collapses collation-equal spellings. */
+	private function user_meta_row_keys( $user_id, $key ) {
+		global $wpdb;
+		if ( ! isset( $wpdb ) || ! is_object( $wpdb ) || ! method_exists( $wpdb, 'get_col' ) || empty( $wpdb->usermeta ) ) {
+			return array();
+		}
+		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
+		$found = $wpdb->get_col( $wpdb->prepare( "SELECT meta_key FROM {$wpdb->usermeta} WHERE user_id = %d AND meta_key = %s", (int) $user_id, (string) $key ) );
+		// get_col() returns [] on a failed query too; null lets the caller fail closed.
+		return ( '' !== (string) ( $wpdb->last_error ?? '' ) || ! is_array( $found ) ) ? null : $found;
 	}
 
 	/** User-meta keys whose (hash/secret) VALUE is withheld from read output. */
@@ -1141,6 +1160,12 @@ trait WPVibe_CLI_Roles {
 		}
 		$key = (string) $positional[1];
 
+		// Core unslashes meta keys and matches them under the column collation, so a
+		// padded, disguised or backslashed key can bind to a row the name checks never see.
+		if ( $key !== trim( $key ) || self::option_name_not_printable_ascii( $key ) || false !== strpos( $key, '\\' ) ) {
+			return $this->error_result( __( 'Refused: user meta keys must be printable ASCII with no spaces or backslashes. WordPress meta keys are plain slugs; a padded or disguised key can address a different (possibly protected) row than it appears to. Re-run with the exact key.', 'vibe-ai' ) );
+		}
+
 		// Hard denylist FIRST, unconditional (no --force, refused even on the
 		// approved path): these keys ARE the capability/session system's storage.
 		// Writing wp_capabilities grants roles around every cap check; clobbering
@@ -1148,7 +1173,19 @@ trait WPVibe_CLI_Roles {
 		// extend an attacker's own. (A session write alone is not a full forgery:
 		// the auth-cookie HMAC also needs the wp-config salts, which `config get`
 		// blocks. It stays denied as a denial/persistence primitive.)
-		if ( $this->is_hard_denied_user_meta( $key ) ) {
+		$denied      = $this->is_hard_denied_user_meta( $key );
+		$stored_keys = $denied ? array() : $this->user_meta_row_keys( (int) $user->ID, $key );
+		if ( null === $stored_keys ) {
+			/* translators: %s: meta key */
+			return $this->error_result( sprintf( __( 'Refused: could not check which stored user meta row \'%s\' resolves to (database error). Nothing was written; try again.', 'vibe-ai' ), $key ) );
+		}
+		foreach ( $stored_keys as $stored ) {
+			if ( $this->is_hard_denied_user_meta( $stored ) ) {
+				$denied = true;
+				break;
+			}
+		}
+		if ( $denied ) {
 			/* translators: %s: meta key */
 			return $this->error_result( sprintf( __( 'Refused: \'%s\' stores WordPress capabilities or session/credential data. Writing it via user meta would change roles or sessions around the permission system. Change roles with `user set-role`/`user add-role`/`user remove-role`; there is no --force override for this key.', 'vibe-ai' ), $key ) );
 		}

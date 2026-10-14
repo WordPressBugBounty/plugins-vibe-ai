@@ -70,7 +70,16 @@ trait WPVibe_CLI_Misc {
 	}
 
 
+	/** Plugins hooked on menu saves (Ocean Extra) call get_current_screen(), which only wp-admin loads; it returns null here. */
+	private function load_admin_screen_api() {
+		if ( ! function_exists( 'get_current_screen' ) ) {
+			require_once ABSPATH . 'wp-admin/includes/screen.php';
+		}
+	}
+
+
 	private function handle_menu_create( $positional, $flags ) {
+		$this->load_admin_screen_api();
 		$reject = $this->reject_unknown_flags( 'menu create', $flags, array( 'porcelain' ) );
 		if ( $reject ) {
 			return $reject;
@@ -107,6 +116,7 @@ trait WPVibe_CLI_Misc {
 	 * path here must sanitize_text_field before it reaches core.
 	 */
 	private function handle_menu_item_add( $positional, $flags ) {
+		$this->load_admin_screen_api();
 		$sub    = $this->current_command;
 		$known  = array( 'description', 'target', 'classes', 'parent_id', 'position', 'porcelain' );
 		if ( 'menu item add-custom' === $sub ) {
@@ -257,6 +267,7 @@ trait WPVibe_CLI_Misc {
 
 
 	private function handle_menu_item_update( $positional, $flags ) {
+		$this->load_admin_screen_api();
 		$reject = $this->reject_unknown_flags( 'menu item update', $flags, array( 'title', 'link', 'description', 'target', 'classes', 'parent_id', 'position' ), array(
 			'attr_title' => __( 'The title attribute is outside the emulated subset; edit it in wp-admin (Appearance > Menus).', 'vibe-ai' ),
 			'xfn'        => __( 'XFN relationships are outside the emulated subset; edit them in wp-admin (Appearance > Menus).', 'vibe-ai' ),
@@ -347,6 +358,7 @@ trait WPVibe_CLI_Misc {
 
 
 	private function handle_menu_item_delete( $positional, $flags ) {
+		$this->load_admin_screen_api();
 		$reject = $this->reject_unknown_flags( 'menu item delete', $flags, array() );
 		if ( $reject ) {
 			return $reject;
