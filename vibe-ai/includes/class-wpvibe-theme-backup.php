@@ -42,6 +42,12 @@ class WPVibe_Theme_Backup {
 	// Version 2 binds each archive to its name (#1682); version 1 (1.24.0, 1.24.1 release candidates) is still read.
 	const MAGIC    = "WPVIBE-SEALED-2\n";
 	const MAGIC_V1 = "WPVIBE-SEALED-1\n";
+	// Version 3 is AES-256-GCM through OpenSSL, for hosts without the sodium extension: WordPress's PHP polyfill seals under
+	// 1 MB/s there, long enough for a publish to hit the host's time limit (#1763).
+	const MAGIC_V3 = "WPVIBE-SEALED-3\n";
+	const GCM      = 'aes-256-gcm';
+	const GCM_SALT = 24;                                  // The same length as a secretstream header, so one read takes either.
+	const GCM_TAG  = 16;
 	const CHUNK    = 65536;
 	// .kept archives (leftovers kept beside a complete backup) are pruned to the newest few per theme.
 	const KEPT = 3;
@@ -1073,16 +1079,28 @@ class WPVibe_Theme_Backup {
 	// The two stream functions below need file handles: chunked encryption cannot go through WP_Filesystem's whole-file
 	// reads and writes without holding the whole theme in memory.
 
-	/** Encrypt a file in chunks (libsodium secretstream; WordPress polyfills it where the extension is missing), bound to $bound. */
-	private static function seal( $src, $dest, $bound ) {
+	/**
+	 * Encrypt a file in chunks, bound to $bound: libsodium secretstream where the extension is loaded, AES-256-GCM where it
+	 * isn't and OpenSSL can (#1763), and WordPress's sodium polyfill, slow but working, where neither is there.
+	 * $openssl forces the choice, for the tests.
+	 */
+	private static function seal( $src, $dest, $bound, $openssl = null ) {
 		$key = self::key( true );
 		$in  = $key ? @fopen( $src, 'rb' ) : false; // phpcs:ignore WordPress.WP.AlternativeFunctions.file_system_operations_fopen, WordPress.PHP.NoSilencedErrors.Discouraged -- chunked encryption needs a handle; a failure returns false.
 		$out = $in ? @fopen( $dest, 'wb' ) : false; // phpcs:ignore WordPress.WP.AlternativeFunctions.file_system_operations_fopen, WordPress.PHP.NoSilencedErrors.Discouraged -- chunked encryption needs a handle; a failure returns false.
 		$ok  = false;
 		if ( $out ) {
 			try {
-				list( $state, $header ) = sodium_crypto_secretstream_xchacha20poly1305_init_push( $key );
-				$ok    = self::write( $out, self::MAGIC . $header );
+				$gcm = null === $openssl ? self::use_openssl() : $openssl;
+				if ( $gcm ) {
+					$salt     = random_bytes( self::GCM_SALT );
+					$ok       = self::write( $out, self::MAGIC_V3 . $salt );
+					$file_key = self::gcm_key( $key, $salt );
+					$count    = 0;
+				} else {
+					list( $state, $header ) = sodium_crypto_secretstream_xchacha20poly1305_init_push( $key );
+					$ok = self::write( $out, self::MAGIC . $header );
+				}
 				$chunk = fread( $in, self::CHUNK ); // phpcs:ignore WordPress.WP.AlternativeFunctions.file_system_operations_fread -- chunked encryption needs a handle.
 				$ok    = $ok && false !== $chunk;
 				do {
@@ -1090,7 +1108,13 @@ class WPVibe_Theme_Backup {
 					$next  = feof( $in ) ? '' : fread( $in, self::CHUNK ); // phpcs:ignore WordPress.WP.AlternativeFunctions.file_system_operations_fread -- chunked encryption needs a handle.
 					$ok    = $ok && false !== $next && ( '' !== $next || feof( $in ) );
 					$final = '' === $next;
-					$ok    = $ok && self::write( $out, sodium_crypto_secretstream_xchacha20poly1305_push( $state, $chunk, $bound, $final ? SODIUM_CRYPTO_SECRETSTREAM_XCHACHA20POLY1305_TAG_FINAL : self::TAG_MESSAGE ) );
+					if ( $ok && $gcm ) {
+						$tag    = '';
+						$cipher = openssl_encrypt( $chunk, self::GCM, $file_key, OPENSSL_RAW_DATA, self::gcm_nonce( $count++, $final ), $tag, $bound, self::GCM_TAG );
+						$ok     = is_string( $cipher ) && self::GCM_TAG === strlen( (string) $tag ) && self::write( $out, $cipher . $tag );
+					} elseif ( $ok ) {
+						$ok = self::write( $out, sodium_crypto_secretstream_xchacha20poly1305_push( $state, $chunk, $bound, $final ? SODIUM_CRYPTO_SECRETSTREAM_XCHACHA20POLY1305_TAG_FINAL : self::TAG_MESSAGE ) );
+					}
 					$chunk = $next;
 				} while ( $ok && ! $final );
 			} catch ( \Throwable $e ) {
@@ -1102,6 +1126,48 @@ class WPVibe_Theme_Backup {
 		if ( ! $ok && $out ) {
 			wp_delete_file( $dest );
 		}
+		return $ok;
+	}
+
+	/** No sodium extension, and an OpenSSL that really does AES-256-GCM here (a FIPS build or an old library may refuse). */
+	private static function use_openssl() {
+		if ( extension_loaded( 'sodium' ) || ! function_exists( 'openssl_encrypt' ) || ! function_exists( 'openssl_decrypt' ) || ! function_exists( 'hash_hkdf' ) ) {
+			return false;
+		}
+		$tag = '';
+		// phpcs:ignore WordPress.PHP.NoSilencedErrors.Discouraged -- an unknown cipher warns; the answer is then no.
+		return is_string( @openssl_encrypt( 'x', self::GCM, str_repeat( "\0", 32 ), OPENSSL_RAW_DATA, str_repeat( "\0", 12 ), $tag, '', self::GCM_TAG ) ) && self::GCM_TAG === strlen( (string) $tag );
+	}
+
+	/** Each archive gets its own key from its random salt, so a counter is a safe nonce and the sodium key is never used for AES. */
+	private static function gcm_key( $key, $salt ) {
+		// A disabled function returns null on PHP 7.4, and OpenSSL would take that as an all-zero key: never go on without a real one.
+		$derived = function_exists( 'hash_hkdf' ) ? hash_hkdf( 'sha256', $key, 32, 'wpvibe-theme-backup-v3-aes-256-gcm', $salt ) : null;
+		if ( ! is_string( $derived ) || 32 !== strlen( $derived ) ) {
+			throw new \RuntimeException( 'No archive key.' );
+		}
+		return $derived;
+	}
+
+	/** The chunk's place and whether it is the last: moving, dropping or adding a chunk then fails to authenticate. */
+	private static function gcm_nonce( $count, $final ) {
+		return str_repeat( "\0", 7 ) . pack( 'N', $count ) . ( $final ? "\1" : "\0" );
+	}
+
+	/** Decrypt the chunks after a version 3 header, writing each only once it has authenticated. */
+	private static function unseal_gcm( $in, $out, $key, $salt, $bound ) {
+		$file_key = self::gcm_key( $key, $salt );
+		$size     = self::CHUNK + self::GCM_TAG;
+		$chunk    = (string) fread( $in, $size ); // phpcs:ignore WordPress.WP.AlternativeFunctions.file_system_operations_fread -- chunked decryption needs a handle.
+		$count    = 0;
+		do {
+			$next  = feof( $in ) ? '' : (string) fread( $in, $size ); // phpcs:ignore WordPress.WP.AlternativeFunctions.file_system_operations_fread -- chunked decryption needs a handle.
+			$final = '' === $next;
+			$ok    = strlen( $chunk ) >= self::GCM_TAG && ( $final || strlen( $chunk ) === $size );
+			$plain = $ok ? openssl_decrypt( (string) substr( $chunk, 0, -self::GCM_TAG ), self::GCM, $file_key, OPENSSL_RAW_DATA, self::gcm_nonce( $count++, $final ), substr( $chunk, -self::GCM_TAG ), $bound ) : false;
+			$ok    = is_string( $plain ) && self::write( $out, $plain );
+			$chunk = $next;
+		} while ( $ok && ! $final );
 		return $ok;
 	}
 
@@ -1121,7 +1187,9 @@ class WPVibe_Theme_Backup {
 				$head  = (string) fread( $in, strlen( self::MAGIC ) + SODIUM_CRYPTO_SECRETSTREAM_XCHACHA20POLY1305_HEADERBYTES ); // phpcs:ignore WordPress.WP.AlternativeFunctions.file_system_operations_fread -- chunked decryption needs a handle.
 				$magic = substr( $head, 0, strlen( self::MAGIC ) );
 				$bound = self::MAGIC_V1 === $magic ? '' : $bound;
-				if ( in_array( $magic, array( self::MAGIC, self::MAGIC_V1 ), true ) && strlen( $head ) === strlen( self::MAGIC ) + SODIUM_CRYPTO_SECRETSTREAM_XCHACHA20POLY1305_HEADERBYTES ) {
+				if ( self::MAGIC_V3 === $magic ) {
+					$ok = strlen( $head ) === strlen( self::MAGIC ) + self::GCM_SALT && self::unseal_gcm( $in, $out, $key, substr( $head, strlen( self::MAGIC ) ), $bound );
+				} elseif ( in_array( $magic, array( self::MAGIC, self::MAGIC_V1 ), true ) && strlen( $head ) === strlen( self::MAGIC ) + SODIUM_CRYPTO_SECRETSTREAM_XCHACHA20POLY1305_HEADERBYTES ) {
 					$state = sodium_crypto_secretstream_xchacha20poly1305_init_pull( substr( $head, strlen( self::MAGIC ) ), $key );
 					$ok    = true;
 					$final = false;

@@ -4,7 +4,7 @@ Tags: mcp, claude, chatgpt, ai-assistant, mcp-server
 Requires at least: 6.0
 Tested up to: 7.1
 Requires PHP: 7.4
-Stable tag: 1.24.2
+Stable tag: 1.24.3
 License: GPL-2.0-or-later
 License URI: https://www.gnu.org/licenses/gpl-2.0.html
 
@@ -183,6 +183,9 @@ Yes. Connected sites are unlimited on every plan, including the free plan. Conne
 No. You ask in plain words and your AI does the work, including writing theme code.
 
 == Changelog ==
+
+= 1.24.3 =
+* Fix: Publishing a draft theme no longer runs into the host's time limit on servers without PHP's sodium extension. Theme backups there are now encrypted with OpenSSL, which takes well under a second for most themes instead of up to minutes. On those servers, large backups made by older versions can still be slow to restore, and a backup made by 1.24.3 can't be restored after downgrading to an older version.
 
 = 1.24.2 =
 * Fix: Administrators can edit Advanced Custom Fields values through WPVibe again, on posts they can edit, as they can in wp-admin. Since 1.24.1 these edits were refused with Advanced Custom Fields 6.8.11 and later. The account needs the unfiltered_html capability, so on multisite only Super Admins can; taxonomy fields that save to the post's terms stay with wp-admin. Other roles are pointed to the post's editor in wp-admin.
